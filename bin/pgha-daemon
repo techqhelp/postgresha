@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""
+pgha-daemon — entry point for the pgha HA daemon process.
+
+Usage:
+    pgha-daemon [--config /etc/pgha/pgha.conf]
+"""
+
+import argparse
+import sys
+import os
+
+# Allow running from source tree without installing
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from pgha.daemon import PgHaDaemon
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="pgha — PostgreSQL HA Heartbeat Manager for GCP"
+    )
+    parser.add_argument(
+        "--config", "-c",
+        default="/etc/pgha/pgha.conf",
+        metavar="FILE",
+        help="Path to pgha.conf (default: /etc/pgha/pgha.conf)",
+    )
+    args = parser.parse_args()
+
+    daemon = PgHaDaemon(cfg_path=args.config)
+    daemon.run()
+
+
+if __name__ == "__main__":
+    main()

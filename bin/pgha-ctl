@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""
+pgha-ctl — Command-line control tool for the pgha daemon.
+
+Communicates with the running daemon over its Unix domain socket.
+
+Usage examples:
+    pgha-ctl status
+    pgha-ctl status --json
+    pgha-ctl switchover
+    pgha-ctl switchover --force
+"""
+
+import argparse
+import json
+import os
+import socket
+import sys
+import textwrap
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+DEFAULT_SOCKET = "/var/run/pgha/pgha.sock"
+DEFAULT_CONFIG = "/etc/pgha/pgha.conf"
+
+
+def _send(sock_path: str, payload: dict) -> dict:
+    """Send a JSON command to the daemon socket and return the response."""
+    if not os.path.exists(sock_path):
+        print(f"ERROR: pgha socket not found at {sock_path}. "
+              "Is the daemon running?", file=sys.stderr)
+        sys.exit(1)
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(10)
+        try:
+            s.connect(sock_path)
+            s.sendall(json.dumps(payload).encode() + b"\n")
+            data = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+                if b"\n" in chunk:
+                    break
+        except socket.timeout:
+            print("ERROR: timed out waiting for daemon response", file=sys.stderr)
+            sys.exit(1)
+        except ConnectionRefusedError:
+            print("ERROR: daemon not available", file=sys.stderr)
+            sys.exit(1)
+
+    return json.loads(data.decode().strip())
+
+
+def cmd_status(args) -> None:
+    resp = _send(args.socket, {"cmd": "status"})
+
+    if "error" in resp:
+        print(f"ERROR: {resp['error']}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return
+
+    local = resp.get("local", {})
+    peer  = resp.get("peer", {})
+    pg    = resp.get("postgres", {})
+    os_s  = resp.get("os", {})
+
+    role_icon   = {"primary": "★", "standby": "☆"}.get(
+        local.get("role", ""), "?")
+    peer_alive  = "✓ alive" if peer.get("alive") else "✗ dead"
+    peer_age    = f" (last HB: {peer.get('last_hb_age')}s ago)" \
+                  if peer.get("last_hb_age") is not None else ""
+
+    print(textwrap.dedent(f"""
+    ┌─────────────────────────────────────────────────────────────┐
+    │  pgha Cluster: {resp.get('cluster', 'unknown'):<45}│
+    ├─────────────────────────────────────────────────────────────┤
+    │  LOCAL NODE                                                  │
+    │    Name:       {local.get('node', '?'):<44}│
+    │    Role:       {role_icon} {local.get('role', '?'):<43}│
+    │    Health:     {local.get('health', '?'):<44}│
+    │    PostgreSQL: {local.get('pg_state', '?'):<44}│
+    │    Disk:       {local.get('disk_state', '?'):<44}│
+    ├─────────────────────────────────────────────────────────────┤
+    │  PEER NODE                                                   │
+    │    Name:       {peer.get('node', '?'):<44}│
+    │    Status:     {peer_alive}{peer_age:<35}│
+    │    Role:       {peer.get('role', '?'):<44}│
+    │    Health:     {peer.get('health', '?'):<44}│
+    │    PostgreSQL: {peer.get('pg_state', '?'):<44}│
+    ├─────────────────────────────────────────────────────────────┤
+    │  POSTGRESQL (local)                                          │
+    │    State:      {pg.get('state', 'N/A'):<44}│
+    │    Healthy:    {str(pg.get('ok', 'N/A')):<44}│
+    │    Message:    {str(pg.get('message', '')):<44}│
+    ├─────────────────────────────────────────────────────────────┤
+    │  OS (local)                                                  │
+    │    CPU:        {str(os_s.get('cpu_pct', 'N/A')) + '%':<44}│
+    │    Memory:     {str(os_s.get('mem_pct', 'N/A')) + '%':<44}│
+    │    Disk:       {str(os_s.get('disk_pct', 'N/A')) + '%':<44}│
+    │    Degraded:   {str(os_s.get('degraded', 'N/A')):<44}│
+    └─────────────────────────────────────────────────────────────┘
+    """).strip())
+
+
+def cmd_switchover(args) -> None:
+    if not args.force:
+        confirm = input(
+            "This will demote the current PRIMARY. "
+            "Type 'yes' to confirm: ")
+        if confirm.strip().lower() != "yes":
+            print("Aborted.")
+            return
+
+    resp = _send(args.socket, {"cmd": "switchover"})
+    if "error" in resp:
+        print(f"ERROR: {resp['error']}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Switchover initiated: {resp.get('result', resp)}")
+    print("Monitor progress with: pgha-ctl status")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="pgha-ctl",
+        description="Control tool for the pgha HA daemon",
+    )
+    parser.add_argument(
+        "--socket", "-s",
+        default=DEFAULT_SOCKET,
+        metavar="SOCK",
+        help=f"Unix socket path (default: {DEFAULT_SOCKET})",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # --- status ----------------------------------------------------------
+    p_status = subparsers.add_parser("status", help="Show cluster status")
+    p_status.add_argument(
+        "--json", action="store_true",
+        help="Output raw JSON")
+    p_status.set_defaults(func=cmd_status)
+
+    # --- switchover -------------------------------------------------------
+    p_sw = subparsers.add_parser(
+        "switchover",
+        help="Initiate a planned switchover (must run on PRIMARY)")
+    p_sw.add_argument(
+        "--force", "-f", action="store_true",
+        help="Skip confirmation prompt")
+    p_sw.set_defaults(func=cmd_switchover)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

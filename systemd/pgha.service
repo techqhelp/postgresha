@@ -1,0 +1,38 @@
+[Unit]
+Description=pgha — PostgreSQL HA Heartbeat Manager (GCP RPD)
+Documentation=https://github.com/yourorg/pgha
+After=network-online.target
+Wants=network-online.target
+# Do NOT start before postgresql — pgha starts postgres itself
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/pgha-daemon --config /etc/pgha/pgha.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+
+# Logging (journald captures stdout/stderr; file handler writes /var/log/pgha/)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pgha
+
+# Runtime directories
+RuntimeDirectory=pgha
+RuntimeDirectoryMode=0750
+
+# Ensure log directory exists
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0755 /var/log/pgha
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0750 /var/run/pgha
+
+# Security hardening
+NoNewPrivileges=no
+PrivateTmp=no
+ProtectSystem=off
+
+[Install]
+WantedBy=multi-user.target
