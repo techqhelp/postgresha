@@ -219,11 +219,11 @@ class PgHaDaemon:
                                 log.warning(
                                     "Heartbeat fallback: peer %s is STANDBY+DISK_DETACHED "
                                     "— peer self-demoted after PG crash. "
-                                    "Starting FailoverEngine.",
+                                    "Starting FailoverEngine (skip_fence=True).",
                                     peer_snap.name,
                                 )
                                 threading.Thread(
-                                    target=self._failover.execute,
+                                    target=lambda: self._failover.execute(skip_fence=True),
                                     name="pg-fail-failover",
                                     daemon=True,
                                 ).start()
@@ -374,15 +374,16 @@ class PgHaDaemon:
             elif cmd == "PG_FAIL_HANDOFF":
                 # AUTOMATIC failover: primary's PostgreSQL crashed; primary already
                 # released all resources.  Use FailoverEngine — NOT SwitchoverEngine.
+                # skip_fence=True: peer self-demoted, disk is already free.
                 conn.sendall(
                     json.dumps({"cmd": "PG_FAIL_HANDOFF_ACK"}).encode() + b"\n")
                 log.warning(
-                    "PG_FAIL_HANDOFF from %s — peer PG crashed, "
-                    "starting FailoverEngine", addr)
+                    "PG_FAIL_HANDOFF from %s — peer PG crashed and released all "
+                    "resources. Starting FailoverEngine (skip_fence=True).", addr)
                 with self._failover_lock:
                     if self._local.is_standby() and self._failover.should_attempt():
                         threading.Thread(
-                            target=self._failover.execute,
+                            target=lambda: self._failover.execute(skip_fence=True),
                             name="pg-fail-failover",
                             daemon=True,
                         ).start()

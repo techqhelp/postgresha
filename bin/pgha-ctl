@@ -137,7 +137,8 @@ def main() -> None:
         help=f"Unix socket path (default: {DEFAULT_SOCKET})",
     )
 
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.required = True
 
     # --- status ----------------------------------------------------------
     p_status = subparsers.add_parser("status", help="Show cluster status")

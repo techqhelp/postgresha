@@ -95,17 +95,25 @@ class FailoverEngine:
             return False
         return True
 
-    def execute(self) -> bool:
+    def execute(self, skip_fence: bool = False) -> bool:
         """
         Run the full failover sequence.
         Returns True on success, False on failure.
+
+        Parameters
+        ----------
+        skip_fence : bool
+            If True, skip the VERIFY / FENCE / WAIT steps.  Use this when
+            the primary has already released all resources (PG_FAIL_HANDOFF
+            or heartbeat fallback detected STANDBY+DISK_DETACHED).
         """
         self._attempts         += 1
         self._last_attempt_ts  = time.monotonic()
 
         log.warning(
-            "=== AUTOMATIC FAILOVER STARTING (attempt %d/%d) ===",
+            "=== AUTOMATIC FAILOVER STARTING (attempt %d/%d%s) ===",
             self._attempts, _MAX_ATTEMPTS,
+            ", skip_fence=True" if skip_fence else "",
         )
         self._emit(HaEventType.FAILOVER_STARTED,
                    f"Attempt {self._attempts}/{_MAX_ATTEMPTS}")
@@ -122,6 +130,10 @@ class FailoverEngine:
         ]
 
         for step_name, step_fn in steps:
+            if skip_fence and step_name in ("VERIFY", "FENCE", "WAIT"):
+                log.info("Failover step: %s — SKIPPED (peer already released resources)",
+                         step_name)
+                continue
             log.info("Failover step: %s", step_name)
             try:
                 step_fn()

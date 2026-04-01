@@ -205,7 +205,14 @@ class DiskManager:
         project  = self._cfg.gcp.project_id
         peer     = self._cfg.cluster.peer_node
         zone     = self._cfg.peer_zone
-        dev_name = self._cfg.gcp.disk_device_name
+
+        # Look up the actual deviceName on the peer — it may differ from
+        # our configured disk_device_name if the disk was attached manually.
+        dev_name = self._lookup_device_name(peer, zone)
+        if dev_name is None:
+            log.warning("FENCING: disk not found on %s — already detached?",
+                        peer)
+            return
 
         log.warning("FENCING: force-detaching disk '%s' from %s (%s)",
                     dev_name, peer, zone)
@@ -275,7 +282,13 @@ class DiskManager:
         project  = self._cfg.gcp.project_id
         zone     = self._cfg.my_zone
         inst     = self._cfg.cluster.node_name
-        dev_name = self._cfg.gcp.disk_device_name
+
+        # Look up actual deviceName — may differ from config if originally
+        # attached outside pgha (e.g. manual gcloud attach, console).
+        dev_name = self._lookup_device_name(inst, zone)
+        if dev_name is None:
+            log.info("Disk not attached to %s — skipping detach", inst)
+            return
 
         log.info("Detaching disk '%s' from %s", dev_name, inst)
 
@@ -458,6 +471,29 @@ class DiskManager:
             return cfg.zone_primary
         if instance_name == cfg.instance_standby:
             return cfg.zone_standby
+        return None
+
+    def _lookup_device_name(self, instance_name: str, zone: str) -> Optional[str]:
+        """Query GCP for the actual deviceName of our regional disk on an instance.
+
+        The deviceName can differ from the configured disk_device_name if the
+        disk was attached manually, via the console, or by a different tool.
+        GCP detachDisk requires the exact deviceName, so we must look it up.
+        Returns None if the disk is not attached to the instance.
+        """
+        project   = self._cfg.gcp.project_id
+        disk_name = self._cfg.gcp.disk_name
+        url = (f"{_COMPUTE_BASE}/projects/{project}/zones/{zone}"
+               f"/instances/{instance_name}")
+        try:
+            resp = requests.get(url, headers=self._auth_headers(), timeout=30)
+            resp.raise_for_status()
+            for disk in resp.json().get("disks", []):
+                source = disk.get("source", "")
+                if source.endswith(f"/disks/{disk_name}"):
+                    return disk.get("deviceName")
+        except Exception as exc:
+            log.warning("_lookup_device_name(%s): %s", instance_name, exc)
         return None
 
     def _wait_zone_op(self, op_name: str, zone: str,
