@@ -516,9 +516,9 @@ class PgHaDaemon:
                 },
                 "peer": {
                     "node":       peer.name,
-                    "role":       peer.role.value,
-                    "health":     peer.health.value,
-                    "pg_state":   peer.pg_state.value,
+                    "role":       peer.role.value  if self._hb_mgr.is_peer_alive() else "unknown",
+                    "health":     peer.health.value if self._hb_mgr.is_peer_alive() else "unknown",
+                    "pg_state":   peer.pg_state.value if self._hb_mgr.is_peer_alive() else "unknown",
                     "last_hb_age": round(
                         time.time() - peer.last_heartbeat_ts, 1)
                     if peer.last_heartbeat_ts else None,
