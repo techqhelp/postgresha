@@ -60,6 +60,7 @@ class PostgresMonitor:
         self._stop_evt   = threading.Event()
         self._snapshot: Optional[PgHealthSnapshot] = None
         self._fail_count = 0
+        self._active     = False          # only check PG when node is PRIMARY
 
         self._thread = threading.Thread(
             target=self._loop, name="pg-monitor", daemon=True)
@@ -89,6 +90,14 @@ class PostgresMonitor:
             self._snapshot = None
             self._fail_count = 0
 
+    def set_active(self, active: bool) -> None:
+        """Enable/disable PG checks.  Disable on STANDBY (PG is not running)."""
+        self._active = active
+        if not active:
+            with self._lock:
+                self._snapshot = None
+                self._fail_count = 0
+
     # ------------------------------------------------------------------
     # Internal loop
     # ------------------------------------------------------------------
@@ -96,6 +105,9 @@ class PostgresMonitor:
     def _loop(self) -> None:
         interval = self._cfg.monitor.check_interval
         while not self._stop_evt.is_set():
+            if not self._active:
+                self._stop_evt.wait(timeout=interval)
+                continue
             snap = self._check()
             with self._lock:
                 self._snapshot = snap

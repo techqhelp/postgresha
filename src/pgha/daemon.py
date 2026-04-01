@@ -149,6 +149,9 @@ class PgHaDaemon:
         # Clear stale monitor snapshot from before election so the main
         # loop does not overwrite the state the election just set.
         self._pg_mon.reset()
+        # Only run PG health checks when we are PRIMARY (PG is not
+        # running on a STANDBY node — checking it just spams warnings).
+        self._pg_mon.set_active(role == NodeRole.PRIMARY)
 
         # Main event loop
         try:
@@ -171,6 +174,9 @@ class PgHaDaemon:
                 self._handle_event(evt)
 
             # --- Refresh local node state from monitors -----------------
+            # Only run PG health checks when PRIMARY (standby has no PG running).
+            self._pg_mon.set_active(self._local.is_primary())
+
             pg_snap = self._pg_mon.snapshot()
             os_snap = self._os_mon.snapshot()
 
@@ -267,6 +273,7 @@ class PgHaDaemon:
 
         self._local.set_role(NodeRole.STANDBY)
         self._local.set_pg_state(PgState.STOPPED)
+        self._pg_mon.set_active(False)
         log.info("Self-demotion complete — now STANDBY")
 
         # Notify standby to trigger FailoverEngine (automatic — not switchover).
