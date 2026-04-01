@@ -98,10 +98,10 @@ class SwitchoverEngine:
 
         steps = [
             ("PRE_CHECK",   self._step_pre_check),
+            ("VIP_RELEASE", self._step_release_vip),   # IP first — clients stop connecting before disk moves
             ("PG_STOP",     self._step_stop_postgres),
             ("UMOUNT",      self._step_umount),
             ("DETACH",      self._step_detach_disk),
-            ("VIP_RELEASE", self._step_release_vip),
             ("SIGNAL_PEER", self._step_signal_peer),
             ("DEMOTE",      self._step_demote),
         ]

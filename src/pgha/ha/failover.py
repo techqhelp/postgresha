@@ -24,6 +24,7 @@ HaEvent(FAILOVER_FAILED).  A retry back-off prevents tight loops.
 
 import logging
 import queue
+import socket
 import time
 from typing import Optional
 
@@ -188,10 +189,22 @@ class FailoverEngine:
                 "Proceeding with fast failover.", peer, status
             )
         else:
-            # RUNNING, STAGING, STOPPING, SUSPENDED
+            # RUNNING, STAGING, STOPPING, SUSPENDED — possible network partition.
+            # Secondary check: TCP probe to peer's PostgreSQL port.
+            # If the port is reachable the primary is alive and serving clients;
+            # this is a pure heartbeat-path flap, NOT a real node death.
+            # Aborting here prevents a false-positive disk force-detach.
+            if self._is_peer_pg_reachable():
+                raise RuntimeError(
+                    f"ABORT: peer {peer} is {status} and PostgreSQL port "
+                    f"{self._cfg.postgresql.port} is reachable via TCP. "
+                    "Heartbeat path failed but database is up and serving. "
+                    "Aborting failover to prevent false-positive disk detach "
+                    "on a live primary."
+                )
             log.warning(
                 "VERIFY: peer %s is %s — network partition detected. "
-                "VPC heartbeat lost but VM is alive. "
+                "VPC heartbeat lost, VM alive, PostgreSQL TCP probe failed. "
                 "Proceeding with STONITH (disk force-detach) as arbitration. "
                 "(Pacemaker last-man-standing: this node fences peer and wins.)",
                 peer, status
@@ -266,6 +279,24 @@ class FailoverEngine:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _is_peer_pg_reachable(self) -> bool:
+        """
+        TCP probe to peer's PostgreSQL port.
+
+        Returns True if a TCP connection to peer_ip:postgresql.port succeeds
+        within 2 seconds.  Used in VERIFY to distinguish a true network
+        partition (peer unreachable on all paths) from a UDP-only heartbeat
+        flap (peer reachable via PostgreSQL port but not via heartbeat UDP).
+        """
+        try:
+            with socket.create_connection(
+                (self._cfg.cluster.peer_ip, self._cfg.postgresql.port),
+                timeout=2.0,
+            ):
+                return True
+        except OSError:
+            return False
 
     def _emit(self, event_type: HaEventType, message: str) -> None:
         evt = HaEvent(

@@ -30,8 +30,8 @@ Requires:       python3 >= 3.9
 Requires:       python3-psutil
 # psycopg2 — PostgreSQL driver
 Requires:       python3-psycopg2
-# GCP SDK libraries (installed via pip if not available as RPMs)
-# google-cloud-compute and google-auth are pulled from PyPI in %install
+# GCP libraries (installed via pip if not available as RPMs)
+# google-auth is pulled from PyPI in %install
 # util-linux for mount/umount
 Requires:       util-linux
 # systemd for service management
@@ -101,7 +101,6 @@ install -m 0644 systemd/pgha.service  %{buildroot}%{_unitdir}/pgha.service
 # Install GCP Python dependencies via pip into the sitelib
 # (These are not packaged as OS RPMs in standard repos)
 pip3 install --no-deps --target=%{buildroot}%{python3_sitelib} \
-    google-cloud-compute \
     google-auth \
     || true
 

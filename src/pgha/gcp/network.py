@@ -14,7 +14,7 @@ The internal TCP/IP forwarding inside GCP's SDN is instant so
 clients see sub-second reconnects after the alias IP moves.
 
 Implementation note:
-  Uses the raw Compute REST API via requests.patch() together with the
+  Uses the raw Compute REST API via requests together with the
   NIC fingerprint, matching the proven pattern used in production.
   The SDK's update_network_interface() omits the fingerprint field and
   can cause 412 Precondition Failed errors on some API versions.
@@ -33,7 +33,6 @@ from typing import List, Optional
 import google.auth
 import requests
 from google.auth.transport.requests import Request as GoogleAuthRequest
-from google.cloud import compute_v1
 from google.oauth2 import service_account
 
 from pgha.config import Config
@@ -52,8 +51,7 @@ class NetworkManager:
 
     def __init__(self, cfg: Config) -> None:
         self._cfg = cfg
-        self._instances_client = self._build_instances_client()
-        self._zone_ops_client  = self._build_zone_ops_client()
+        self._creds = self._build_credentials()
 
     # ------------------------------------------------------------------
     # Credential helpers
@@ -72,27 +70,13 @@ class NetworkManager:
             scopes=["https://www.googleapis.com/auth/cloud-platform"])
         return creds
 
-    def _fresh_token(self) -> str:
-        """Return a valid Bearer token, refreshing if necessary."""
-        creds = self._build_credentials()
-        creds.refresh(GoogleAuthRequest())
-        return creds.token
-
-    def _build_instances_client(self) -> compute_v1.InstancesClient:
-        key = self._cfg.gcp.service_account_key
-        if key and os.path.isfile(key):
-            sa_creds = service_account.Credentials.from_service_account_file(
-                key, scopes=["https://www.googleapis.com/auth/cloud-platform"])
-            return compute_v1.InstancesClient(credentials=sa_creds)
-        return compute_v1.InstancesClient()
-
-    def _build_zone_ops_client(self) -> compute_v1.ZoneOperationsClient:
-        key = self._cfg.gcp.service_account_key
-        if key and os.path.isfile(key):
-            sa_creds = service_account.Credentials.from_service_account_file(
-                key, scopes=["https://www.googleapis.com/auth/cloud-platform"])
-            return compute_v1.ZoneOperationsClient(credentials=sa_creds)
-        return compute_v1.ZoneOperationsClient()
+    def _auth_headers(self) -> dict:
+        """Return Authorization + Content-Type headers with a fresh token."""
+        self._creds.refresh(GoogleAuthRequest())
+        return {
+            "Authorization": f"Bearer {self._creds.token}",
+            "Content-Type":  "application/json",
+        }
 
     # ------------------------------------------------------------------
     # Public VIP management
@@ -154,15 +138,20 @@ class NetworkManager:
     # NIC / alias helpers
     # ------------------------------------------------------------------
 
-    def _get_nic(self, instance_name: str, zone: str) -> compute_v1.NetworkInterface:
-        """Fetch the instance and return the target NIC object."""
-        inst = self._instances_client.get(
-            project  = self._cfg.gcp.project_id,
-            zone     = zone,
-            instance = instance_name,
-        )
-        for nic in inst.network_interfaces:
-            if nic.name == self._cfg.gcp.nic_name:
+    def _get_instance_json(self, instance_name: str, zone: str) -> dict:
+        """Fetch the instance JSON from the REST API."""
+        project = self._cfg.gcp.project_id
+        url = (f"{_COMPUTE_BASE}/projects/{project}/zones/{zone}"
+               f"/instances/{instance_name}")
+        resp = requests.get(url, headers=self._auth_headers(), timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _get_nic(self, instance_name: str, zone: str) -> dict:
+        """Fetch the instance and return the target NIC dict."""
+        inst = self._get_instance_json(instance_name, zone)
+        for nic in inst.get("networkInterfaces", []):
+            if nic.get("name") == self._cfg.gcp.nic_name:
                 return nic
         raise RuntimeError(
             f"NIC '{self._cfg.gcp.nic_name}' not found on {instance_name}")
@@ -171,8 +160,8 @@ class NetworkManager:
         try:
             nic = self._get_nic(instance_name, zone)
             return any(
-                a.ip_cidr_range == self._cfg.gcp.vip_cidr
-                for a in nic.alias_ip_ranges
+                a.get("ipCidrRange") == self._cfg.gcp.vip_cidr
+                for a in nic.get("aliasIpRanges", [])
             )
         except Exception as exc:
             log.warning("_has_alias_ip(%s): %s", instance_name, exc)
@@ -183,7 +172,7 @@ class NetworkManager:
         nic      = self._get_nic(instance_name, zone)
         vip_cidr = self._cfg.gcp.vip_cidr
 
-        existing = [a.ip_cidr_range for a in nic.alias_ip_ranges]
+        existing = [a.get("ipCidrRange") for a in nic.get("aliasIpRanges", [])]
         if vip_cidr in existing:
             log.info("VIP %s already on %s — skipping add",
                      vip_cidr, instance_name)
@@ -201,7 +190,7 @@ class NetworkManager:
         nic      = self._get_nic(instance_name, zone)
         vip_cidr = self._cfg.gcp.vip_cidr
 
-        existing = [a.ip_cidr_range for a in nic.alias_ip_ranges]
+        existing = [a.get("ipCidrRange") for a in nic.get("aliasIpRanges", [])]
         if vip_cidr not in existing:
             log.info("VIP %s not on %s — skipping remove",
                      vip_cidr, instance_name)
@@ -223,14 +212,17 @@ class NetworkManager:
         self,
         instance_name: str,
         zone: str,
-        nic: compute_v1.NetworkInterface,
+        nic: dict,
         alias_ranges: List[dict],
+        max_retries: int = 3,
     ) -> None:
         """
         PATCH the NIC alias IP list via the raw Compute REST API.
 
         Uses the NIC fingerprint (required to avoid 412 errors) and a
-        fresh Bearer token from google.auth — matching the tested pattern.
+        fresh Bearer token from google.auth.
+        Retries on 409 (conflict), 412 (fingerprint mismatch), and 429
+        (rate limit) with a re-fetched fingerprint.
         """
         project  = self._cfg.gcp.project_id
         nic_name = self._cfg.gcp.nic_name
@@ -240,27 +232,42 @@ class NetworkManager:
             f"/instances/{instance_name}/updateNetworkInterface"
             f"?networkInterface={nic_name}"
         )
-        headers = {
-            "Authorization": f"Bearer {self._fresh_token()}",
-            "Content-Type":  "application/json",
-        }
-        payload = {
-            "aliasIpRanges": alias_ranges,
-            "fingerprint":   nic.fingerprint,
-        }
 
-        log.debug("PATCH %s  payload=%s", url, json.dumps(payload))
-        resp = requests.patch(url, headers=headers, json=payload, timeout=30)
+        fingerprint = nic.get("fingerprint", "")
 
-        log.debug("PATCH status=%d  body=%s", resp.status_code, resp.text)
-        if resp.status_code != 200:
+        for attempt in range(1, max_retries + 1):
+            headers = self._auth_headers()
+            payload = {
+                "aliasIpRanges": alias_ranges,
+                "fingerprint":   fingerprint,
+            }
+
+            log.debug("PATCH %s  payload=%s (attempt %d)",
+                      url, json.dumps(payload), attempt)
+            resp = requests.patch(url, headers=headers, json=payload,
+                                  timeout=30)
+
+            log.debug("PATCH status=%d  body=%s", resp.status_code, resp.text)
+
+            if resp.status_code == 200:
+                op_name = resp.json().get("name")
+                if op_name:
+                    self._wait_zone_op(op_name, zone)
+                return
+
+            if resp.status_code in (409, 412, 429) and attempt < max_retries:
+                wait = 2 * attempt
+                log.warning("PATCH returned %d — retrying in %ds (attempt %d/%d)",
+                            resp.status_code, wait, attempt, max_retries)
+                time.sleep(wait)
+                # Re-fetch the NIC to get the latest fingerprint
+                fresh_nic = self._get_nic(instance_name, zone)
+                fingerprint = fresh_nic.get("fingerprint", "")
+                continue
+
             raise RuntimeError(
                 f"PATCH updateNetworkInterface failed "
                 f"(HTTP {resp.status_code}): {resp.text}")
-
-        op_name = resp.json().get("name")
-        if op_name:
-            self._wait_zone_op(op_name, zone)
 
     # ------------------------------------------------------------------
     # Operation poller
@@ -273,17 +280,21 @@ class NetworkManager:
         timeout  = self._cfg.gcp.api_timeout
         deadline = time.monotonic() + timeout
 
+        url = (f"{_COMPUTE_BASE}/projects/{project}/zones/{zone}"
+               f"/operations/{op_name}")
+
         log.debug("[WAIT] operation %s", op_name)
         while time.monotonic() < deadline:
-            op = self._zone_ops_client.get(
-                project   = project,
-                zone      = zone,
-                operation = op_name,
-            )
-            log.debug("[WAIT] status=%s", op.status)
-            if op.status == "DONE":
-                if op.error:
-                    errors = "; ".join(e.message for e in op.error.errors)
+            resp = requests.get(url, headers=self._auth_headers(), timeout=30)
+            resp.raise_for_status()
+            op = resp.json()
+            status = op.get("status", "")
+            log.debug("[WAIT] status=%s", status)
+            if status == "DONE":
+                error = op.get("error")
+                if error:
+                    errors = "; ".join(
+                        e.get("message", "") for e in error.get("errors", []))
                     raise RuntimeError(
                         f"GCP operation {op_name} failed: {errors}")
                 return
@@ -301,11 +312,11 @@ class NetworkManager:
         """Confirm the alias IP is visible after the PATCH operation."""
         log.debug("[VERIFY] checking %s present on %s", cidr, instance_name)
         nic = self._get_nic(instance_name, zone)
-        actual = [a.ip_cidr_range for a in nic.alias_ip_ranges]
+        actual = [a.get("ipCidrRange") for a in nic.get("aliasIpRanges", [])]
         if cidr in actual:
-            log.info("✓ VIP %s confirmed present on %s", cidr, instance_name)
+            log.info("VIP %s confirmed present on %s", cidr, instance_name)
         else:
-            log.warning("⚠ VIP %s NOT found on %s after add (got: %s)",
+            log.warning("VIP %s NOT found on %s after add (got: %s)",
                         cidr, instance_name, actual)
 
     def _verify_alias_absent(
@@ -313,9 +324,9 @@ class NetworkManager:
         """Confirm the alias IP has been removed after the PATCH operation."""
         log.debug("[VERIFY] checking %s absent on %s", cidr, instance_name)
         nic = self._get_nic(instance_name, zone)
-        actual = [a.ip_cidr_range for a in nic.alias_ip_ranges]
+        actual = [a.get("ipCidrRange") for a in nic.get("aliasIpRanges", [])]
         if cidr not in actual:
-            log.info("✓ VIP %s confirmed removed from %s", cidr, instance_name)
+            log.info("VIP %s confirmed removed from %s", cidr, instance_name)
         else:
-            log.warning("⚠ VIP %s still present on %s after remove",
+            log.warning("VIP %s still present on %s after remove",
                         cidr, instance_name)

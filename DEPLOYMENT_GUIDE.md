@@ -216,7 +216,7 @@ sudo bash ~/pgha/scripts/install.sh
 ```
 
 The script will:
-- Install all Python dependencies (`psutil`, `psycopg2-binary`, `google-cloud-compute`, `google-auth`, `requests`, `dataclasses` backport for Python 3.6)
+- Install all Python dependencies (`psutil`, `psycopg2-binary`, `google-auth`, `requests`, `dataclasses` backport for Python 3.6)
 - Install the pgha Python package via `setup.py`
 - Copy binaries to `/usr/bin/pgha-daemon` and `/usr/bin/pgha-ctl`
 - Install `/etc/pgha/pgha.conf` (only if not already present)

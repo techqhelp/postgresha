@@ -246,10 +246,10 @@ class PgHaDaemon:
         """
         log.warning("Self-demoting PRIMARY after PostgreSQL failure …")
         for action, fn in [
+            ("release_vip",     self._net_mgr.release_vip),       # IP first — stop clients connecting to dying node
             ("stop_postgres",   lambda: self._disk_mgr.stop_postgres("immediate")),
             ("unmount_disk",    self._disk_mgr.unmount_disk),
             ("detach_disk",     self._disk_mgr.detach_disk),
-            ("release_vip",     self._net_mgr.release_vip),
         ]:
             try:
                 fn()

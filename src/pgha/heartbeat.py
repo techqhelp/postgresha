@@ -244,21 +244,54 @@ class HeartbeatManager:
 
             age = time.time() - last_ts
             if age > dead_interval and was_alive:
+                # Secondary check: TCP probe to peer's PostgreSQL port.
+                # If the peer's DB port is still reachable, the UDP heartbeat
+                # path is flapping but the peer is alive — do NOT declare dead.
+                if self._is_peer_pg_reachable():
+                    log.warning(
+                        "Peer %s UDP heartbeat silent for %.1fs but PostgreSQL "
+                        "port %d is reachable via TCP — treating as heartbeat "
+                        "flap, NOT declaring peer dead",
+                        self._cfg.cluster.peer_node, age,
+                        self._cfg.postgresql.port,
+                    )
+                    continue
+
                 with self._lock:
                     self._peer_alive = False
                 log.warning(
-                    "Peer %s declared DEAD — last heartbeat %.1fs ago",
+                    "Peer %s declared DEAD — last heartbeat %.1fs ago, "
+                    "PostgreSQL TCP probe also failed",
                     self._cfg.cluster.peer_node, age,
                 )
                 self._emit(
                     HaEventType.PEER_DEAD,
                     f"No heartbeat from {self._cfg.cluster.peer_node} "
-                    f"for {age:.1f}s (threshold {dead_interval}s)",
+                    f"for {age:.1f}s (threshold {dead_interval}s) and "
+                    f"TCP probe to port {self._cfg.postgresql.port} failed",
                 )
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _is_peer_pg_reachable(self) -> bool:
+        """
+        TCP probe to peer's PostgreSQL port as a secondary reachability check.
+
+        Returns True if we can open a TCP connection to peer_ip:postgresql.port
+        within 2 seconds.  A successful TCP handshake means the peer VM (and
+        its network stack) is up — the UDPheartbeat failure is a flap, not a
+        real node death.
+        """
+        try:
+            with socket.create_connection(
+                (self._cfg.cluster.peer_ip, self._cfg.postgresql.port),
+                timeout=2.0,
+            ):
+                return True
+        except OSError:
+            return False
 
     def _emit(self, event_type: HaEventType, message: str) -> None:
         evt = HaEvent(

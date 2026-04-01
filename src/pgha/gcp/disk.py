@@ -9,7 +9,8 @@ Handles:
   - Starting / stopping PostgreSQL after disk operations.
 
 GCP API notes:
-  - Uses google-cloud-compute (Compute Engine Python client).
+  - Uses the raw Compute Engine REST API (compute/v1) with
+    google-auth for credential management.
   - Regional disk attach/detach is done via the Instances service.
   - "Force attach" bypasses the check that the disk is still attached
     elsewhere — essential for split-brain recovery.
@@ -32,13 +33,17 @@ import subprocess
 import time
 from typing import Optional
 
-from google.cloud import compute_v1
+import google.auth
+import requests
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
 
 from pgha.config import Config
 from pgha.models import DiskState
 
 log = logging.getLogger(__name__)
+
+_COMPUTE_BASE = "https://compute.googleapis.com/compute/v1"
 
 
 class DiskManager:
@@ -50,16 +55,14 @@ class DiskManager:
 
     def __init__(self, cfg: Config) -> None:
         self._cfg = cfg
-        self._instances_client = self._build_instances_client()
-        self._disks_client     = self._build_disks_client()
-        self._zone_ops_client  = self._build_zone_ops_client()
-        self._region_ops_client = self._build_region_ops_client()
+        self._creds = self._build_credentials()
 
     # ------------------------------------------------------------------
-    # Client constructors
+    # Credential helpers
     # ------------------------------------------------------------------
 
-    def _credentials(self):
+    def _build_credentials(self):
+        """Return google.auth credentials (service-account key or ADC)."""
         key = self._cfg.gcp.service_account_key
         if key and os.path.isfile(key):
             log.debug("Using service account key: %s", key)
@@ -68,31 +71,17 @@ class DiskManager:
                 scopes=["https://www.googleapis.com/auth/cloud-platform"],
             )
         log.debug("Using default/Workload Identity credentials")
-        return None  # SDK will auto-detect from env/metadata server
+        creds, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        return creds
 
-    def _build_instances_client(self) -> compute_v1.InstancesClient:
-        creds = self._credentials()
-        if creds:
-            return compute_v1.InstancesClient(credentials=creds)
-        return compute_v1.InstancesClient()
-
-    def _build_disks_client(self) -> compute_v1.RegionDisksClient:
-        creds = self._credentials()
-        if creds:
-            return compute_v1.RegionDisksClient(credentials=creds)
-        return compute_v1.RegionDisksClient()
-
-    def _build_zone_ops_client(self) -> compute_v1.ZoneOperationsClient:
-        creds = self._credentials()
-        if creds:
-            return compute_v1.ZoneOperationsClient(credentials=creds)
-        return compute_v1.ZoneOperationsClient()
-
-    def _build_region_ops_client(self) -> compute_v1.RegionOperationsClient:
-        creds = self._credentials()
-        if creds:
-            return compute_v1.RegionOperationsClient(credentials=creds)
-        return compute_v1.RegionOperationsClient()
+    def _auth_headers(self) -> dict:
+        """Return Authorization + Content-Type headers with a fresh token."""
+        self._creds.refresh(GoogleAuthRequest())
+        return {
+            "Authorization": f"Bearer {self._creds.token}",
+            "Content-Type":  "application/json",
+        }
 
     # ------------------------------------------------------------------
     # Disk state queries
@@ -104,20 +93,24 @@ class DiskManager:
         zone    = self._cfg.my_zone
         inst    = self._cfg.cluster.node_name
 
+        url = (f"{_COMPUTE_BASE}/projects/{project}/zones/{zone}"
+               f"/instances/{inst}")
         try:
-            instance = self._instances_client.get(
-                project=project, zone=zone, instance=inst)
+            resp = requests.get(url, headers=self._auth_headers(), timeout=30)
+            resp.raise_for_status()
+            instance = resp.json()
         except Exception as exc:
             log.error("get_disk_state: instance lookup failed: %s", exc)
             return DiskState.UNKNOWN
 
-        disk_url = self._disk_self_link()
-        for disk in instance.disks:
-            if disk.source == disk_url or disk_url.endswith(
-                    disk.source.split("/")[-1]):
-                if disk.mode == "READ_WRITE":
+        disk_name = self._cfg.gcp.disk_name
+        for disk in instance.get("disks", []):
+            source = disk.get("source", "")
+            if source.endswith(f"/disks/{disk_name}"):
+                mode = disk.get("mode", "")
+                if mode == "READ_WRITE":
                     return DiskState.ATTACHED_RW
-                if disk.mode == "READ_ONLY":
+                if mode == "READ_ONLY":
                     return DiskState.ATTACHED_RO
 
         return DiskState.DETACHED
@@ -126,33 +119,46 @@ class DiskManager:
         """
         Return the instance name that currently has the disk in RW mode,
         or None if the disk is not attached anywhere in RW mode.
-        """
-        project = self._cfg.gcp.project_id
-        region  = self._cfg.gcp.region
 
+        Uses a single regional disk GET — the 'users' field lists all
+        attached instances. Then checks the mode on the disk metadata
+        without additional per-instance API calls.
+        """
+        project   = self._cfg.gcp.project_id
+        region    = self._cfg.gcp.region
+        disk_name = self._cfg.gcp.disk_name
+
+        url = (f"{_COMPUTE_BASE}/projects/{project}/regions/{region}"
+               f"/disks/{disk_name}")
         try:
-            disk = self._disks_client.get(
-                project=project, region=region,
-                disk=self._cfg.gcp.disk_name)
+            resp = requests.get(url, headers=self._auth_headers(), timeout=30)
+            resp.raise_for_status()
+            disk = resp.json()
         except Exception as exc:
             log.error("current_rw_holder: disk get failed: %s", exc)
             return None
 
-        for user_url in disk.users:
-            # user_url is like .../instances/pg-primary
+        users = disk.get("users", [])
+        if not users:
+            return None
+
+        # For each user, check by fetching the instance
+        for user_url in users:
             instance_name = user_url.rstrip("/").split("/")[-1]
-            # Check if it's RW
             zone = self._zone_for_instance(instance_name)
             if zone is None:
                 continue
+            inst_url = (f"{_COMPUTE_BASE}/projects/{project}/zones/{zone}"
+                        f"/instances/{instance_name}")
             try:
-                inst_obj = self._instances_client.get(
-                    project=project, zone=zone, instance=instance_name)
-                disk_url = self._disk_self_link()
-                for d in inst_obj.disks:
-                    if (d.source == disk_url or disk_url.endswith(
-                            d.source.split("/")[-1])) \
-                            and d.mode == "READ_WRITE":
+                resp = requests.get(inst_url, headers=self._auth_headers(),
+                                    timeout=30)
+                resp.raise_for_status()
+                inst_data = resp.json()
+                for d in inst_data.get("disks", []):
+                    source = d.get("source", "")
+                    if source.endswith(f"/disks/{disk_name}") \
+                            and d.get("mode") == "READ_WRITE":
                         return instance_name
             except Exception as exc:
                 log.warning("current_rw_holder: could not inspect %s: %s",
@@ -171,10 +177,12 @@ class DiskManager:
         This is used as the quorum/tie-breaker check before fencing.
         """
         project = self._cfg.gcp.project_id
+        url = (f"{_COMPUTE_BASE}/projects/{project}/zones/{zone}"
+               f"/instances/{instance_name}")
         try:
-            instance = self._instances_client.get(
-                project=project, zone=zone, instance=instance_name)
-            status = instance.status
+            resp = requests.get(url, headers=self._auth_headers(), timeout=30)
+            resp.raise_for_status()
+            status = resp.json().get("status", "UNKNOWN")
             log.info("GCP quorum check: instance %s status = %s",
                      instance_name, status)
             return status
@@ -202,26 +210,33 @@ class DiskManager:
         log.warning("FENCING: force-detaching disk '%s' from %s (%s)",
                     dev_name, peer, zone)
 
+        url = (f"{_COMPUTE_BASE}/projects/{project}/zones/{zone}"
+               f"/instances/{peer}/detachDisk?deviceName={dev_name}")
         try:
-            op = self._instances_client.detach_disk(
-                project         = project,
-                zone            = zone,
-                instance        = peer,
-                device_name     = dev_name,
-            )
-            self._wait_zone_op(op, zone)
-            log.info("Disk successfully detached from peer %s", peer)
-        except Exception as exc:
-            # If peer is already down GCP may return a 4xx — treat as OK
-            log.warning("force_detach_from_peer: %s (continuing anyway)", exc)
+            resp = requests.post(url, headers=self._auth_headers(), timeout=30)
+            if resp.status_code in (200, 204):
+                op_name = resp.json().get("name")
+                if op_name:
+                    self._wait_zone_op(op_name, zone)
+                log.info("Disk successfully detached from peer %s", peer)
+            elif resp.status_code in (400, 404):
+                # Peer already down or disk not attached — treat as OK
+                log.warning("force_detach_from_peer: HTTP %d (peer likely "
+                            "already fenced): %s", resp.status_code, resp.text)
+            else:
+                raise RuntimeError(
+                    f"force_detach_from_peer failed (HTTP {resp.status_code}): "
+                    f"{resp.text}")
+        except requests.exceptions.RequestException as exc:
+            log.warning("force_detach_from_peer network error: %s "
+                        "(continuing anyway)", exc)
 
     def attach_disk_rw(self) -> None:
         """
         Attach the RPD to *this* node in READ_WRITE mode.
 
-        Uses AttachDiskInstanceRequest with force_attach=True so we can
-        attach even if the disk is still registered on the (fenced) peer.
-        operation.result() blocks until the LRO completes.
+        Uses forceAttach=true so we can attach even if the disk is still
+        registered on the (fenced) peer.
         """
         project  = self._cfg.gcp.project_id
         zone     = self._cfg.my_zone
@@ -231,28 +246,27 @@ class DiskManager:
         log.info("Attaching disk '%s' to %s (%s) in RW mode",
                  dev_name, inst, zone)
 
-        attached_disk = compute_v1.AttachedDisk()
-        attached_disk.source      = self._disk_self_link()
-        attached_disk.mode        = "READ_WRITE"
-        attached_disk.auto_delete = False
-        attached_disk.device_name = dev_name
-
-        request = compute_v1.AttachDiskInstanceRequest(
-            project                = project,
-            zone                   = zone,
-            instance               = inst,
-            attached_disk_resource = attached_disk,
-            force_attach           = True,
-        )
+        url = (f"{_COMPUTE_BASE}/projects/{project}/zones/{zone}"
+               f"/instances/{inst}/attachDisk?forceAttach=true")
+        payload = {
+            "source":     self._disk_self_link(),
+            "mode":       "READ_WRITE",
+            "autoDelete": False,
+            "deviceName": dev_name,
+        }
 
         try:
-            op = self._instances_client.attach_disk(request=request)
-            # google-cloud-compute 1.3.x returns a raw Operation proto;
-            # poll it with _wait_zone_op (ExtendedOperation/.result() needs >=1.4).
-            self._wait_zone_op(op, zone)
+            resp = requests.post(url, headers=self._auth_headers(),
+                                 json=payload, timeout=30)
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"attachDisk failed (HTTP {resp.status_code}): {resp.text}")
+            op_name = resp.json().get("name")
+            if op_name:
+                self._wait_zone_op(op_name, zone)
             log.info("Disk '%s' successfully attached to %s in RW mode",
                      dev_name, inst)
-        except Exception as exc:
+        except requests.exceptions.RequestException as exc:
             raise RuntimeError(
                 f"attach_disk_rw failed for {inst}: {exc}") from exc
 
@@ -264,16 +278,19 @@ class DiskManager:
         dev_name = self._cfg.gcp.disk_device_name
 
         log.info("Detaching disk '%s' from %s", dev_name, inst)
+
+        url = (f"{_COMPUTE_BASE}/projects/{project}/zones/{zone}"
+               f"/instances/{inst}/detachDisk?deviceName={dev_name}")
         try:
-            op = self._instances_client.detach_disk(
-                project     = project,
-                zone        = zone,
-                instance    = inst,
-                device_name = dev_name,
-            )
-            self._wait_zone_op(op, zone)
+            resp = requests.post(url, headers=self._auth_headers(), timeout=30)
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"detachDisk failed (HTTP {resp.status_code}): {resp.text}")
+            op_name = resp.json().get("name")
+            if op_name:
+                self._wait_zone_op(op_name, zone)
             log.info("Disk detached from %s", inst)
-        except Exception as exc:
+        except requests.exceptions.RequestException as exc:
             raise RuntimeError(
                 f"detach_disk failed for {inst}: {exc}") from exc
 
@@ -347,7 +364,8 @@ class DiskManager:
         """Start PostgreSQL using pg_ctl; wait up to pg_start_timeout."""
         cfg     = self._cfg.postgresql
         timeout = cfg.pg_start_timeout
-        cmd     = [cfg.pg_ctl, "start", "-D", cfg.data_dir, "-w",
+        os_user = cfg.pg_os_user
+        cmd     = ["sudo", "-u", os_user, cfg.pg_ctl, "start", "-D", cfg.data_dir, "-w",
                    "-t", str(timeout)]
         log.info("Starting PostgreSQL: %s", " ".join(cmd))
         result = subprocess.run(
@@ -355,7 +373,6 @@ class DiskManager:
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             universal_newlines=True,
             timeout=timeout + 10,
-            preexec_fn=self._run_as_postgres(),
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -366,7 +383,8 @@ class DiskManager:
         """Stop PostgreSQL using pg_ctl (mode: smart|fast|immediate)."""
         cfg     = self._cfg.postgresql
         timeout = cfg.pg_stop_timeout
-        cmd     = [cfg.pg_ctl, "stop", "-D", cfg.data_dir,
+        os_user = cfg.pg_os_user
+        cmd     = ["sudo", "-u", os_user, cfg.pg_ctl, "stop", "-D", cfg.data_dir,
                    "-m", mode, "-w", "-t", str(timeout)]
         log.info("Stopping PostgreSQL (mode=%s): %s", mode, " ".join(cmd))
         result = subprocess.run(
@@ -374,7 +392,6 @@ class DiskManager:
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             universal_newlines=True,
             timeout=timeout + 10,
-            preexec_fn=self._run_as_postgres(),
         )
         if result.returncode != 0:
             log.warning("pg_ctl stop returned %d: %s",
@@ -417,23 +434,27 @@ class DiskManager:
             return cfg.zone_standby
         return None
 
-    def _wait_zone_op(self, operation, zone: str,
+    def _wait_zone_op(self, op_name: str, zone: str,
                       poll_interval: float = 2.0) -> None:
         """Poll a zonal LRO until it finishes or times out."""
-        project = self._cfg.gcp.project_id
-        timeout = self._cfg.gcp.api_timeout
+        project  = self._cfg.gcp.project_id
+        timeout  = self._cfg.gcp.api_timeout
         deadline = time.monotonic() + timeout
 
-        # The client may return a ZoneOperation object directly
-        op_name = getattr(operation, "name", None) or str(operation)
+        url = (f"{_COMPUTE_BASE}/projects/{project}/zones/{zone}"
+               f"/operations/{op_name}")
 
         while time.monotonic() < deadline:
-            op = self._zone_ops_client.get(
-                project=project, zone=zone, operation=op_name)
-            if op.status == compute_v1.Operation.Status.DONE:
-                if op.error:
+            resp = requests.get(url, headers=self._auth_headers(), timeout=30)
+            resp.raise_for_status()
+            op = resp.json()
+            status = op.get("status", "")
+            log.debug("[WAIT] operation %s status=%s", op_name, status)
+            if status == "DONE":
+                error = op.get("error")
+                if error:
                     errors = "; ".join(
-                        e.message for e in op.error.errors)
+                        e.get("message", "") for e in error.get("errors", []))
                     raise RuntimeError(
                         f"GCP operation {op_name} failed: {errors}")
                 return
