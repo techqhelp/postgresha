@@ -28,6 +28,7 @@ Management API commands (JSON over Unix socket)
 import json
 import logging
 import logging.handlers
+import hmac
 import os
 import queue
 import signal
@@ -145,6 +146,10 @@ class PgHaDaemon:
         role = self._election.elect()
         log.info("Initial role: %s", role)
 
+        # Clear stale monitor snapshot from before election so the main
+        # loop does not overwrite the state the election just set.
+        self._pg_mon.reset()
+
         # Main event loop
         try:
             self._main_loop()
@@ -244,6 +249,10 @@ class PgHaDaemon:
         stop PG (best effort), unmount, detach disk, release VIP.
         This clears the way for the standby to run failover.
         """
+        if not self._local.is_primary():
+            log.warning("Self-demote called but node is not PRIMARY — skipping")
+            return
+
         log.warning("Self-demoting PRIMARY after PostgreSQL failure …")
         for action, fn in [
             ("release_vip",     self._net_mgr.release_vip),       # IP first — stop clients connecting to dying node
@@ -274,7 +283,10 @@ class PgHaDaemon:
         """Send PG_FAIL_HANDOFF to peer via TCP, triggering its FailoverEngine."""
         peer_ip = self._cfg.cluster.peer_ip
         log.info("Sending PG_FAIL_HANDOFF to peer %s:%d", peer_ip, _PEER_PORT)
-        msg = json.dumps({"cmd": "PG_FAIL_HANDOFF"}).encode()
+        payload = {"cmd": "PG_FAIL_HANDOFF"}
+        if self._cfg.cluster.peer_auth_token:
+            payload["token"] = self._cfg.cluster.peer_auth_token
+        msg = json.dumps(payload).encode()
         with socket.create_connection((peer_ip, _PEER_PORT), timeout=10) as sock:
             sock.sendall(msg + b"\n")
             resp_raw = sock.recv(256).decode().strip()
@@ -328,6 +340,16 @@ class PgHaDaemon:
             except (json.JSONDecodeError, ValueError, OSError) as exc:
                 log.warning("Peer %s: bad payload: %s", addr, exc)
                 return
+
+            # Authenticate: if peer_auth_token is configured, require it.
+            expected_token = self._cfg.cluster.peer_auth_token
+            if expected_token:
+                if not hmac.compare_digest(req.get("token", ""), expected_token):
+                    log.warning("Peer %s: authentication failed — rejecting %s",
+                                addr, cmd)
+                    conn.sendall(
+                        json.dumps({"error": "auth_failed"}).encode() + b"\n")
+                    return
 
             if cmd == "SWITCHOVER_REQUEST":
                 # MANUAL planned switchover: primary released all resources and

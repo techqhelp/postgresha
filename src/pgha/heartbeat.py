@@ -208,7 +208,7 @@ class HeartbeatManager:
                 self._peer_state.health           = msg.node_health
                 self._peer_state.pg_state         = msg.pg_state
                 self._peer_state.disk_state       = msg.disk_state
-                self._peer_state.last_heartbeat_ts = msg.ts
+                self._peer_state.last_heartbeat_ts = time.time()  # local receive time — avoids clock-skew with peer
                 self._peer_state.heartbeat_seq    = msg.seq
                 self._peer_alive = True
 

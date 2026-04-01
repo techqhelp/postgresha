@@ -360,8 +360,24 @@ class DiskManager:
     # PostgreSQL start / stop
     # ------------------------------------------------------------------
 
+    def _pg_is_running(self) -> bool:
+        """Return True if pg_ctl status reports PostgreSQL is running."""
+        cfg = self._cfg.postgresql
+        try:
+            result = subprocess.run(
+                ["sudo", "-u", cfg.pg_os_user, cfg.pg_ctl, "status",
+                 "-D", cfg.data_dir],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
     def start_postgres(self) -> None:
         """Start PostgreSQL using pg_ctl; wait up to pg_start_timeout.
+
+        Skips start if PostgreSQL is already running (pg_ctl status == 0).
 
         Uses DEVNULL for stdout/stderr instead of PIPE.  pg_ctl start
         forks the postgres daemon which inherits pipe fds — keeping the
@@ -369,6 +385,10 @@ class DiskManager:
         timeout fires (~70 s) and then crash with
         "Invalid file object: <_io.TextIOWrapper>" on Python 3.6.
         """
+        if self._pg_is_running():
+            log.info("PostgreSQL is already running — skipping start")
+            return
+
         cfg     = self._cfg.postgresql
         timeout = cfg.pg_start_timeout
         os_user = cfg.pg_os_user
@@ -469,8 +489,7 @@ class DiskManager:
         raise TimeoutError(
             f"GCP operation {op_name} did not complete in {timeout}s")
 
-    @staticmethod
-    def _is_mounted(mount_pt: str) -> bool:
+    def _is_mounted(self, mount_pt: str) -> bool:
         with open("/proc/mounts", "r") as f:
             for line in f:
                 parts = line.split()
@@ -478,8 +497,7 @@ class DiskManager:
                     return True
         return False
 
-    @staticmethod
-    def _wait_for_device(dev_path: str, timeout: int = 30) -> None:
+    def _wait_for_device(self, dev_path: str, timeout: int = 30) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if os.path.exists(dev_path):

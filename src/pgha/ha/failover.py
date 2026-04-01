@@ -133,6 +133,7 @@ class FailoverEngine:
                            f"Failed at {step_name}: {exc}")
                 return False
 
+        self._attempts = 0  # reset so future failovers are not permanently blocked
         log.warning("=== AUTOMATIC FAILOVER COMPLETED === "
                     "This node is now PRIMARY")
         self._emit(HaEventType.FAILOVER_COMPLETED,

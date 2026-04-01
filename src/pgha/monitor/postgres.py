@@ -83,6 +83,12 @@ class PostgresMonitor:
         snap = self.snapshot()
         return snap is not None and snap.ok
 
+    def reset(self) -> None:
+        """Clear stale snapshot and fail count (call after election)."""
+        with self._lock:
+            self._snapshot = None
+            self._fail_count = 0
+
     # ------------------------------------------------------------------
     # Internal loop
     # ------------------------------------------------------------------
@@ -94,16 +100,19 @@ class PostgresMonitor:
             with self._lock:
                 self._snapshot = snap
             if not snap.ok:
-                self._fail_count += 1
+                with self._lock:
+                    self._fail_count += 1
+                    fc = self._fail_count
                 log.warning("PostgreSQL check FAILED (%d/%d): %s",
-                            self._fail_count,
+                            fc,
                             self._cfg.monitor.pg_fail_threshold,
                             snap.message)
             else:
-                if self._fail_count > 0:
-                    log.info("PostgreSQL recovered after %d failed checks",
-                             self._fail_count)
-                self._fail_count = 0
+                with self._lock:
+                    if self._fail_count > 0:
+                        log.info("PostgreSQL recovered after %d failed checks",
+                                 self._fail_count)
+                    self._fail_count = 0
             self._stop_evt.wait(timeout=interval)
 
     def _check(self) -> PgHealthSnapshot:
@@ -184,8 +193,8 @@ class PostgresMonitor:
             )
 
         conn = psycopg2.connect(dsn)
-        conn.autocommit = True
         try:
+            conn.autocommit = True
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
                 cur.execute(_CHECK_SQL)
                 row = cur.fetchone()
@@ -199,4 +208,5 @@ class PostgresMonitor:
 
     @property
     def consecutive_failures(self) -> int:
-        return self._fail_count
+        with self._lock:
+            return self._fail_count

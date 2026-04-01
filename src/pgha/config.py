@@ -24,6 +24,7 @@ class ClusterCfg:
     dead_interval: float
     quorum_timeout: float
     fence_wait: float
+    peer_auth_token: str
 
 
 @dataclass
@@ -132,6 +133,7 @@ def load(path: str = DEFAULT_CFG) -> Config:
         dead_interval=float(_get("cluster", "dead_interval", fallback=5)),
         quorum_timeout=float(_get("cluster", "quorum_timeout", fallback=10)),
         fence_wait=float(_get("cluster", "fence_wait", fallback=8)),
+        peer_auth_token=_get("cluster", "peer_auth_token", fallback=""),
     )
 
     sak = _get("gcp", "service_account_key", fallback="").strip() or None

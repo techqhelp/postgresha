@@ -202,7 +202,10 @@ class SwitchoverEngine:
     def _step_signal_peer(self) -> None:
         """Send SWITCHOVER_REQUEST to the standby node over TCP."""
         peer_ip  = self._cfg.cluster.peer_ip
-        msg      = json.dumps({"cmd": _CMD_SWITCHOVER_REQUEST}).encode()
+        payload  = {"cmd": _CMD_SWITCHOVER_REQUEST}
+        if self._cfg.cluster.peer_auth_token:
+            payload["token"] = self._cfg.cluster.peer_auth_token
+        msg      = json.dumps(payload).encode()
         log.info("Sending %s to peer %s:%d",
                  _CMD_SWITCHOVER_REQUEST, peer_ip, _MGMT_PORT)
         with socket.create_connection(
@@ -227,6 +230,16 @@ class SwitchoverEngine:
     # ------------------------------------------------------------------
 
     def _step_attach_disk(self) -> None:
+        # Verify the disk is not still held by the peer before attaching.
+        holder = self._disk_mgr.current_rw_holder()
+        peer_inst = self._cfg.gcp.instance_primary \
+            if self._cfg.cluster.node_name != self._cfg.gcp.instance_primary \
+            else self._cfg.gcp.instance_standby
+        if holder == peer_inst:
+            raise RuntimeError(
+                f"Disk is still attached RW to peer {peer_inst} — "
+                "refusing to force-attach during switchover. "
+                "Peer must detach first.")
         self._disk_mgr.attach_disk_rw()
         self._local.set_disk_state(DiskState.ATTACHED_RW)
 
