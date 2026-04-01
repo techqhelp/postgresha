@@ -318,6 +318,17 @@ class PgHaDaemon:
                 "Standby heartbeat fallback will handle promotion.", exc
             )
 
+    def _run_switchover_as_standby(self) -> None:
+        """Wrapper for switchover promotion on standby side.
+
+        Sets _switchover_active so the main loop doesn't start a
+        competing FailoverEngine via heartbeat fallback.
+        """
+        try:
+            self._switchover.execute_as_standby()
+        finally:
+            self._switchover_active.clear()
+
     def _send_pg_fail_handoff(self) -> None:
         """Send PG_FAIL_HANDOFF to peer via TCP, triggering its FailoverEngine."""
         peer_ip = self._cfg.cluster.peer_ip
@@ -397,8 +408,9 @@ class PgHaDaemon:
                     json.dumps({"cmd": "SWITCHOVER_ACCEPT"}).encode() + b"\n")
                 log.info("SWITCHOVER_REQUEST from %s — starting switchover promotion",
                          addr)
+                self._switchover_active.set()
                 threading.Thread(
-                    target=self._switchover.execute_as_standby,
+                    target=self._run_switchover_as_standby,
                     name="switchover-promote",
                     daemon=True,
                 ).start()
@@ -407,6 +419,13 @@ class PgHaDaemon:
                 # AUTOMATIC failover: primary's PostgreSQL crashed; primary already
                 # released all resources.  Use FailoverEngine — NOT SwitchoverEngine.
                 # skip_fence=True: peer self-demoted, disk is already free.
+                if self._switchover_active.is_set():
+                    log.warning(
+                        "PG_FAIL_HANDOFF from %s — IGNORED, switchover already "
+                        "in progress", addr)
+                    conn.sendall(
+                        json.dumps({"cmd": "PG_FAIL_HANDOFF_ACK"}).encode() + b"\n")
+                    return
                 conn.sendall(
                     json.dumps({"cmd": "PG_FAIL_HANDOFF_ACK"}).encode() + b"\n")
                 log.warning(
