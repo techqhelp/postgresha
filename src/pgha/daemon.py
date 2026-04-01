@@ -304,6 +304,7 @@ class PgHaDaemon:
 
         self._local.set_role(NodeRole.STANDBY)
         self._local.set_pg_state(PgState.STOPPED)
+        self._local.set_health(NodeHealth.HEALTHY)
         self._pg_mon.set_active(False)
         self._last_demotion_ts = time.time()
         log.info("Self-demotion complete — now STANDBY")
