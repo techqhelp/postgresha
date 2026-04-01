@@ -51,7 +51,7 @@ pip3 install \
     "psutil>=5.9.0" \
     "psycopg2-binary==2.9.5" \
     "google-auth>=2.17.0" \
-    "requests>=2.28.0"
+    "requests>=2.20.0"
 
 # Python 3.6 needs the dataclasses backport
 PYTHON_MINOR=$(python3 -c "import sys; print(sys.version_info.minor)")

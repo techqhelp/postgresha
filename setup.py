@@ -12,7 +12,7 @@ setup(
         "psutil>=5.9.0",
         "psycopg2-binary==2.9.5",
         "google-auth>=2.17.0",
-        "requests>=2.28.0",
+        "requests>=2.20.0",
     ],
     scripts         = [
         "bin/pgha-daemon",
