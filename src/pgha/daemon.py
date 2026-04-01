@@ -95,6 +95,12 @@ class PgHaDaemon:
         self._event_q   : queue.Queue = queue.Queue(maxsize=_EVENT_QUEUE_SIZE)
         self._stop_evt  = threading.Event()
         self._failover_lock = threading.Lock()
+        # Set while a planned switchover is running on this node.
+        # Prevents the main loop from misinterpreting PG-down as a crash.
+        self._switchover_active = threading.Event()
+        # Timestamp of last self-demotion or switchover demotion.
+        # Heartbeat fallback is suppressed for a grace period after this.
+        self._last_demotion_ts = 0.0
 
         # ---- Sub-system initialisation ----------------------------------
         self._local     = LocalNode(self._cfg)
@@ -184,7 +190,7 @@ class PgHaDaemon:
                 self._local.set_pg_state(pg_snap.state)
                 if not pg_snap.ok:
                     if self._pg_mon.consecutive_failures >= pg_fail_threshold:
-                        if self._local.is_primary():
+                        if self._local.is_primary() and not self._switchover_active.is_set():
                             log.error(
                                 "PostgreSQL has failed %d times on PRIMARY — "
                                 "self-demoting to trigger peer failover",
@@ -206,7 +212,18 @@ class PgHaDaemon:
             # was lost, we catch it here: peer heartbeat still arrives (VM alive)
             # but peer reports role=STANDBY and disk=DETACHED — meaning it gave
             # up all resources and is waiting for us to take over.
-            if self._local.is_standby() and self._hb_mgr.is_peer_alive():
+            # Grace period: suppress heartbeat fallback for 30s after this
+            # node just demoted (switchover or self-demotion).  The peer's
+            # heartbeat may still show STANDBY+DETACHED while it is mid-
+            # promotion — acting on it would cause this node to try to
+            # failover to itself and hit RESOURCE_IN_USE.
+            _demotion_grace = 30
+            _in_grace = (time.time() - self._last_demotion_ts) < _demotion_grace
+
+            if (self._local.is_standby()
+                    and self._hb_mgr.is_peer_alive()
+                    and not _in_grace
+                    and not self._switchover_active.is_set()):
                 peer_snap = self._hb_mgr.peer_snapshot()
                 if (
                     peer_snap.role       == NodeRole.STANDBY
@@ -249,6 +266,20 @@ class PgHaDaemon:
         elif evt.event_type == HaEventType.PEER_RECOVERED:
             log.info("Peer recovered: %s", evt.message)
 
+    # ------------------------------------------------------------------
+    # Switchover wrapper  (sets active flag, deactivates monitor)
+    # ------------------------------------------------------------------
+
+    def _run_switchover(self) -> None:
+        """Wrapper around SwitchoverEngine that coordinates with the main loop."""
+        self._switchover_active.set()
+        self._pg_mon.set_active(False)
+        try:
+            self._switchover.execute_as_primary()
+        finally:
+            self._last_demotion_ts = time.time()
+            self._switchover_active.clear()
+
     def _self_demote_after_pg_failure(self) -> None:
         """
         Primary demotes itself when PG fails unrecoverably:
@@ -274,6 +305,7 @@ class PgHaDaemon:
         self._local.set_role(NodeRole.STANDBY)
         self._local.set_pg_state(PgState.STOPPED)
         self._pg_mon.set_active(False)
+        self._last_demotion_ts = time.time()
         log.info("Self-demotion complete — now STANDBY")
 
         # Notify standby to trigger FailoverEngine (automatic — not switchover).
@@ -488,8 +520,10 @@ class PgHaDaemon:
         if cmd == "switchover":
             if not self._local.is_primary():
                 return {"error": "switchover must be run on the PRIMARY node"}
+            if self._switchover_active.is_set():
+                return {"error": "switchover already in progress"}
             threading.Thread(
-                target=self._switchover.execute_as_primary,
+                target=self._run_switchover,
                 name="switchover",
                 daemon=True,
             ).start()
