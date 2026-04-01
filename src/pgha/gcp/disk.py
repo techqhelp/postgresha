@@ -361,7 +361,14 @@ class DiskManager:
     # ------------------------------------------------------------------
 
     def start_postgres(self) -> None:
-        """Start PostgreSQL using pg_ctl; wait up to pg_start_timeout."""
+        """Start PostgreSQL using pg_ctl; wait up to pg_start_timeout.
+
+        Uses DEVNULL for stdout/stderr instead of PIPE.  pg_ctl start
+        forks the postgres daemon which inherits pipe fds — keeping the
+        pipe open forever, causing subprocess.run() to hang until the
+        timeout fires (~70 s) and then crash with
+        "Invalid file object: <_io.TextIOWrapper>" on Python 3.6.
+        """
         cfg     = self._cfg.postgresql
         timeout = cfg.pg_start_timeout
         os_user = cfg.pg_os_user
@@ -370,13 +377,12 @@ class DiskManager:
         log.info("Starting PostgreSQL: %s", " ".join(cmd))
         result = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            universal_newlines=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=timeout + 10,
         )
         if result.returncode != 0:
             raise RuntimeError(
-                "pg_ctl start failed: {}".format(result.stderr.strip()))
+                "pg_ctl start failed (exit code {})".format(result.returncode))
         log.info("PostgreSQL started successfully")
 
     def stop_postgres(self, mode: str = "fast") -> None:

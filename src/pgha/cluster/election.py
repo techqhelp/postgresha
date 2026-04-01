@@ -111,8 +111,21 @@ class ElectionManager:
         except Exception as exc:
             log.error("[ELECTION] Failed to become PRIMARY: %s", exc)
             self._local.set_health(NodeHealth.FAILED)
+            # Undo any partial work (PG may be running, disk may be mounted)
+            self._rollback_primary()
             # Fall back to standby rather than leaving in unknown state
             return self._become_standby()
+
+    def _rollback_primary(self) -> None:
+        """Best-effort undo of partial _become_primary work."""
+        for action, fn in [
+            ("stop_postgres",  lambda: self._disk_mgr.stop_postgres("immediate")),
+            ("unmount_disk",   self._disk_mgr.unmount_disk),
+        ]:
+            try:
+                fn()
+            except Exception as exc:
+                log.warning("[ELECTION] rollback %s: %s", action, exc)
 
     def _become_standby(self) -> NodeRole:
         """Set up node as STANDBY (PG not running, disk not attached RW)."""
