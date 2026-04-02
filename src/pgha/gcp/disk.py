@@ -253,6 +253,13 @@ class DiskManager:
         log.info("Attaching disk '%s' to %s (%s) in RW mode",
                  dev_name, inst, zone)
 
+        # Check if disk is already attached to this node
+        holder = self.current_rw_holder()
+        if holder == inst:
+            log.info("Disk already attached to %s in RW mode — skipping attach",
+                     inst)
+            return
+
         url = (f"{_COMPUTE_BASE}/projects/{project}/zones/{zone}"
                f"/instances/{inst}/attachDisk?forceAttach=true")
         payload = {
@@ -392,11 +399,9 @@ class DiskManager:
 
         Skips start if PostgreSQL is already running (pg_ctl status == 0).
 
-        Uses DEVNULL for stdout/stderr instead of PIPE.  pg_ctl start
-        forks the postgres daemon which inherits pipe fds — keeping the
-        pipe open forever, causing subprocess.run() to hang until the
-        timeout fires (~70 s) and then crash with
-        "Invalid file object: <_io.TextIOWrapper>" on Python 3.6.
+        Captures stderr to a temporary file (not PIPE) so pg_ctl output
+        is available for debugging without the PIPE fd-inheritance hang
+        that causes subprocess.run() to block ~70s on Python 3.6.
         """
         if self._pg_is_running():
             log.info("PostgreSQL is already running — skipping start")
@@ -408,14 +413,21 @@ class DiskManager:
         cmd     = ["sudo", "-u", os_user, cfg.pg_ctl, "start", "-D", cfg.data_dir, "-w",
                    "-t", str(timeout)]
         log.info("Starting PostgreSQL: %s", " ".join(cmd))
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=timeout + 10,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                "pg_ctl start failed (exit code {})".format(result.returncode))
+
+        import tempfile
+        with tempfile.TemporaryFile(mode='w+t') as err_f:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL, stderr=err_f,
+                timeout=timeout + 10,
+            )
+            if result.returncode != 0:
+                err_f.seek(0)
+                stderr_text = err_f.read().strip() or "(no output)"
+                log.error("pg_ctl start stderr: %s", stderr_text)
+                raise RuntimeError(
+                    "pg_ctl start failed (exit code {}): {}".format(
+                        result.returncode, stderr_text))
         log.info("PostgreSQL started successfully")
 
     def stop_postgres(self, mode: str = "fast") -> None:

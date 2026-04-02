@@ -27,6 +27,7 @@ that the peer completed the switchover successfully.
 
 import json
 import logging
+import os
 import queue
 import socket
 import time
@@ -146,21 +147,44 @@ class SwitchoverEngine:
             ("PROMOTE",  self._step_promote),
         ]
 
+        completed = []
         for step_name, step_fn in steps:
             log.info("Switchover promotion step: %s", step_name)
             try:
                 step_fn()
+                completed.append(step_name)
             except Exception as exc:
                 log.error("Switchover promotion failed at %s: %s",
                           step_name, exc, exc_info=True)
                 self._emit(HaEventType.SWITCHOVER_FAILED,
                            f"Promotion failed at {step_name}: {exc}")
+                # Rollback completed steps in reverse
+                self._rollback_promotion(completed)
                 return False
 
         log.info("=== SWITCHOVER PROMOTION COMPLETE — this node is PRIMARY ===")
         self._emit(HaEventType.SWITCHOVER_COMPLETED,
                    "{} promoted to PRIMARY".format(self._cfg.cluster.node_name))
         return True
+
+    def _rollback_promotion(self, completed: list) -> None:
+        """Undo completed promotion steps in reverse order."""
+        log.warning("Rolling back switchover promotion: %s", completed)
+        for step in reversed(completed):
+            try:
+                if step == "PG_START":
+                    self._disk_mgr.stop_postgres(mode="immediate")
+                    self._local.set_pg_state(PgState.STOPPED)
+                elif step == "MOUNT":
+                    self._disk_mgr.unmount_disk()
+                elif step == "ATTACH":
+                    self._disk_mgr.detach_disk()
+                    self._local.set_disk_state(DiskState.DETACHED)
+                elif step == "VIP":
+                    self._net_mgr.release_vip()
+                log.info("Rollback step %s done", step)
+            except Exception as exc:
+                log.error("Rollback step %s failed: %s", step, exc)
 
     # ------------------------------------------------------------------
     # Primary demote steps
@@ -247,8 +271,34 @@ class SwitchoverEngine:
         self._disk_mgr.mount_disk()
 
     def _step_start_postgres(self) -> None:
-        self._disk_mgr.start_postgres()
-        self._local.set_pg_state(PgState.RUNNING_PRIMARY)
+        # Retry pg_ctl start up to 3 times.  The most common failure is a
+        # stale postmaster.pid from the previous run — pg_ctl cleans it up
+        # on the second attempt once it verifies the old PID is gone.
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                self._disk_mgr.start_postgres()
+                self._local.set_pg_state(PgState.RUNNING_PRIMARY)
+                return
+            except RuntimeError as exc:
+                if attempt < max_retries:
+                    log.warning(
+                        "PG_START attempt %d/%d failed: %s — retrying in 3s",
+                        attempt, max_retries, exc)
+                    # Remove stale postmaster.pid if it exists — common after
+                    # unclean shutdown (disk force-detach / VM crash).
+                    pid_file = os.path.join(
+                        self._cfg.postgresql.data_dir, "postmaster.pid")
+                    if os.path.exists(pid_file):
+                        log.warning("Removing stale %s", pid_file)
+                        try:
+                            os.remove(pid_file)
+                        except OSError as rm_exc:
+                            log.warning("Could not remove %s: %s",
+                                        pid_file, rm_exc)
+                    time.sleep(3)
+                else:
+                    raise
 
     def _step_acquire_vip(self) -> None:
         self._net_mgr.acquire_vip()

@@ -23,6 +23,7 @@ HaEvent(FAILOVER_FAILED).  A retry back-off prevents tight loops.
 """
 
 import logging
+import os
 import queue
 import socket
 import time
@@ -274,8 +275,29 @@ class FailoverEngine:
         self._disk_mgr.mount_disk()
 
     def _step_start_postgres(self) -> None:
-        self._disk_mgr.start_postgres()
-        self._local.set_pg_state(PgState.RUNNING_PRIMARY)
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                self._disk_mgr.start_postgres()
+                self._local.set_pg_state(PgState.RUNNING_PRIMARY)
+                return
+            except RuntimeError as exc:
+                if attempt < max_retries:
+                    log.warning(
+                        "PG_START attempt %d/%d failed: %s — retrying in 3s",
+                        attempt, max_retries, exc)
+                    pid_file = os.path.join(
+                        self._cfg.postgresql.data_dir, "postmaster.pid")
+                    if os.path.exists(pid_file):
+                        log.warning("Removing stale %s", pid_file)
+                        try:
+                            os.remove(pid_file)
+                        except OSError as rm_exc:
+                            log.warning("Could not remove %s: %s",
+                                        pid_file, rm_exc)
+                    time.sleep(3)
+                else:
+                    raise
 
     def _step_acquire_vip(self) -> None:
         self._net_mgr.acquire_vip()
