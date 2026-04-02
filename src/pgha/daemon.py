@@ -218,9 +218,11 @@ class PgHaDaemon:
         role = self._election.elect()
         log.info("Initial role: %s", role)
 
-        # Start EFM on primary only
+        # Manage EFM based on role — start on PRIMARY, stop on STANDBY
         if role == NodeRole.PRIMARY:
             self._efm_start()
+        else:
+            self._efm_stop()
 
         # Clear stale monitor snapshot from before election so the main
         # loop does not overwrite the state the election just set.
