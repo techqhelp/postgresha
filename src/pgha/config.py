@@ -25,6 +25,7 @@ class ClusterCfg:
     quorum_timeout: float
     fence_wait: float
     peer_auth_token: str
+    maintenance_file: str
 
 
 @dataclass
@@ -80,6 +81,12 @@ class LoggingCfg:
 
 
 @dataclass
+class EfmCfg:
+    enabled: bool
+    service_name: str
+
+
+@dataclass
 class ApiCfg:
     socket_path: str
 
@@ -92,6 +99,7 @@ class Config:
     monitor: MonitorCfg
     logging: LoggingCfg
     api: ApiCfg
+    efm: EfmCfg
 
     # Derived helpers
     @property
@@ -134,6 +142,8 @@ def load(path: str = DEFAULT_CFG) -> Config:
         quorum_timeout=float(_get("cluster", "quorum_timeout", fallback=10)),
         fence_wait=float(_get("cluster", "fence_wait", fallback=8)),
         peer_auth_token=_get("cluster", "peer_auth_token", fallback=""),
+        maintenance_file=_get("cluster", "maintenance_file",
+                              fallback="/var/run/pgha/maintenance"),
     )
 
     sak = _get("gcp", "service_account_key", fallback="").strip() or None
@@ -189,6 +199,11 @@ def load(path: str = DEFAULT_CFG) -> Config:
         socket_path=_get("api", "socket_path", fallback="/var/run/pgha/pgha.sock"),
     )
 
+    efm = EfmCfg(
+        enabled=_get("efm", "enabled", fallback="false").lower() in ("true", "1", "yes"),
+        service_name=_get("efm", "service_name", fallback="edb-efm-4.7"),
+    )
+
     return Config(
         cluster=cluster,
         gcp=gcp,
@@ -196,4 +211,5 @@ def load(path: str = DEFAULT_CFG) -> Config:
         monitor=monitor,
         logging=logging_cfg,
         api=api,
+        efm=efm,
     )

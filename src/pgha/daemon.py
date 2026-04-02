@@ -33,6 +33,7 @@ import os
 import queue
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -125,6 +126,67 @@ class PgHaDaemon:
         self._peer_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
+    # Maintenance mode
+    # ------------------------------------------------------------------
+
+    def _is_maintenance(self) -> bool:
+        """Return True if the maintenance flag file exists."""
+        return os.path.isfile(self._cfg.cluster.maintenance_file)
+
+    def _enter_maintenance(self) -> str:
+        """Create the maintenance flag file. Returns status message."""
+        path = self._cfg.cluster.maintenance_file
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(time.strftime("%Y-%m-%dT%H:%M:%S"))
+        log.warning("MAINTENANCE MODE ENABLED — failover/switchover suppressed")
+        return "maintenance mode enabled"
+
+    def _exit_maintenance(self) -> str:
+        """Remove the maintenance flag file. Returns status message."""
+        path = self._cfg.cluster.maintenance_file
+        if os.path.isfile(path):
+            os.remove(path)
+        log.info("MAINTENANCE MODE DISABLED — normal HA operation resumed")
+        return "maintenance mode disabled"
+
+    # ------------------------------------------------------------------
+    # EFM service management
+    # ------------------------------------------------------------------
+
+    def _efm_start(self) -> None:
+        """Start EFM service (only on PRIMARY)."""
+        if not self._cfg.efm.enabled:
+            return
+        svc = self._cfg.efm.service_name
+        log.info("Starting EFM service: %s", svc)
+        try:
+            subprocess.run(
+                ["systemctl", "start", svc],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+        except Exception as exc:
+            log.warning("Failed to start EFM service %s: %s", svc, exc)
+
+    def _efm_stop(self) -> None:
+        """Stop EFM service (when demoting from PRIMARY)."""
+        if not self._cfg.efm.enabled:
+            return
+        svc = self._cfg.efm.service_name
+        log.info("Stopping EFM service: %s", svc)
+        try:
+            subprocess.run(
+                ["systemctl", "stop", svc],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+        except Exception as exc:
+            log.warning("Failed to stop EFM service %s: %s", svc, exc)
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
@@ -147,10 +209,18 @@ class PgHaDaemon:
         # Start peer TCP server (inter-node commands on port 7778)
         self._start_peer_server()
 
+        # Maintenance mode check
+        if self._is_maintenance():
+            log.warning("MAINTENANCE MODE is active — failover/switchover disabled")
+
         # Startup election
         log.info("Running startup cluster election …")
         role = self._election.elect()
         log.info("Initial role: %s", role)
+
+        # Start EFM on primary only
+        if role == NodeRole.PRIMARY:
+            self._efm_start()
 
         # Clear stale monitor snapshot from before election so the main
         # loop does not overwrite the state the election just set.
@@ -191,15 +261,22 @@ class PgHaDaemon:
                 if not pg_snap.ok:
                     if self._pg_mon.consecutive_failures >= pg_fail_threshold:
                         if self._local.is_primary() and not self._switchover_active.is_set():
-                            log.error(
-                                "PostgreSQL has failed %d times on PRIMARY — "
-                                "self-demoting to trigger peer failover",
-                                self._pg_mon.consecutive_failures,
-                            )
-                            self._local.set_health(NodeHealth.FAILED)
-                            # Stop PG, unmount, detach, release VIP so peer
-                            # can take over cleanly
-                            self._self_demote_after_pg_failure()
+                            if self._is_maintenance():
+                                log.warning(
+                                    "PostgreSQL has failed %d times on PRIMARY but "
+                                    "MAINTENANCE MODE is active — NOT self-demoting",
+                                    self._pg_mon.consecutive_failures,
+                                )
+                            else:
+                                log.error(
+                                    "PostgreSQL has failed %d times on PRIMARY — "
+                                    "self-demoting to trigger peer failover",
+                                    self._pg_mon.consecutive_failures,
+                                )
+                                self._local.set_health(NodeHealth.FAILED)
+                                # Stop PG, unmount, detach, release VIP so peer
+                                # can take over cleanly
+                                self._self_demote_after_pg_failure()
                 else:
                     if self._local.health != NodeHealth.HEALTHY:
                         self._local.set_health(NodeHealth.HEALTHY)
@@ -223,7 +300,8 @@ class PgHaDaemon:
             if (self._local.is_standby()
                     and self._hb_mgr.is_peer_alive()
                     and not _in_grace
-                    and not self._switchover_active.is_set()):
+                    and not self._switchover_active.is_set()
+                    and not self._is_maintenance()):
                 peer_snap = self._hb_mgr.peer_snapshot()
                 if (
                     peer_snap.role       == NodeRole.STANDBY
@@ -240,7 +318,7 @@ class PgHaDaemon:
                                     peer_snap.name,
                                 )
                                 threading.Thread(
-                                    target=lambda: self._failover.execute(skip_fence=True),
+                                    target=lambda: self._run_failover(skip_fence=True),
                                     name="pg-fail-failover",
                                     daemon=True,
                                 ).start()
@@ -254,14 +332,19 @@ class PgHaDaemon:
 
         if evt.event_type == HaEventType.PEER_DEAD:
             if self._local.is_standby():
-                log.warning("Peer is dead — initiating automatic failover")
-                with self._failover_lock:
-                    if self._failover.should_attempt():
-                        threading.Thread(
-                            target=self._failover.execute,
-                            name="failover",
-                            daemon=True,
-                        ).start()
+                if self._is_maintenance():
+                    log.warning(
+                        "Peer is dead but MAINTENANCE MODE is active — "
+                        "NOT initiating failover")
+                else:
+                    log.warning("Peer is dead — initiating automatic failover")
+                    with self._failover_lock:
+                        if self._failover.should_attempt():
+                            threading.Thread(
+                                target=self._run_failover,
+                                name="failover",
+                                daemon=True,
+                            ).start()
 
         elif evt.event_type == HaEventType.PEER_RECOVERED:
             log.info("Peer recovered: %s", evt.message)
@@ -274,11 +357,18 @@ class PgHaDaemon:
         """Wrapper around SwitchoverEngine that coordinates with the main loop."""
         self._switchover_active.set()
         self._pg_mon.set_active(False)
+        self._efm_stop()
         try:
             self._switchover.execute_as_primary()
         finally:
             self._last_demotion_ts = time.time()
             self._switchover_active.clear()
+
+    def _run_failover(self, skip_fence=False) -> None:
+        """Wrapper around FailoverEngine that starts EFM on success."""
+        result = self._failover.execute(skip_fence=skip_fence)
+        if result:
+            self._efm_start()
 
     def _self_demote_after_pg_failure(self) -> None:
         """
@@ -291,6 +381,7 @@ class PgHaDaemon:
             return
 
         log.warning("Self-demoting PRIMARY after PostgreSQL failure …")
+        self._efm_stop()
         for action, fn in [
             ("release_vip",     self._net_mgr.release_vip),       # IP first — stop clients connecting to dying node
             ("stop_postgres",   lambda: self._disk_mgr.stop_postgres("immediate")),
@@ -326,7 +417,9 @@ class PgHaDaemon:
         competing FailoverEngine via heartbeat fallback.
         """
         try:
-            self._switchover.execute_as_standby()
+            result = self._switchover.execute_as_standby()
+            if result:
+                self._efm_start()
         finally:
             self._switchover_active.clear()
 
@@ -427,6 +520,13 @@ class PgHaDaemon:
                     conn.sendall(
                         json.dumps({"cmd": "PG_FAIL_HANDOFF_ACK"}).encode() + b"\n")
                     return
+                if self._is_maintenance():
+                    log.warning(
+                        "PG_FAIL_HANDOFF from %s — IGNORED, maintenance mode "
+                        "is active", addr)
+                    conn.sendall(
+                        json.dumps({"cmd": "PG_FAIL_HANDOFF_ACK"}).encode() + b"\n")
+                    return
                 conn.sendall(
                     json.dumps({"cmd": "PG_FAIL_HANDOFF_ACK"}).encode() + b"\n")
                 log.warning(
@@ -435,7 +535,7 @@ class PgHaDaemon:
                 with self._failover_lock:
                     if self._local.is_standby() and self._failover.should_attempt():
                         threading.Thread(
-                            target=lambda: self._failover.execute(skip_fence=True),
+                            target=lambda: self._run_failover(skip_fence=True),
                             name="pg-fail-failover",
                             daemon=True,
                         ).start()
@@ -535,9 +635,13 @@ class PgHaDaemon:
                     "disk_pct": os_s.disk_pct  if os_s else None,
                     "degraded": os_s.degraded  if os_s else None,
                 } if os_s else {},
+                "maintenance": self._is_maintenance(),
             }
 
         if cmd == "switchover":
+            if self._is_maintenance():
+                return {"error": "switchover blocked — maintenance mode is active. "
+                                 "Run 'pgha-ctl maintenance off' first."}
             if not self._local.is_primary():
                 return {"error": "switchover must be run on the PRIMARY node"}
             if self._switchover_active.is_set():
@@ -548,6 +652,14 @@ class PgHaDaemon:
                 daemon=True,
             ).start()
             return {"result": "switchover initiated"}
+
+        if cmd == "maintenance_on":
+            msg = self._enter_maintenance()
+            return {"result": msg}
+
+        if cmd == "maintenance_off":
+            msg = self._exit_maintenance()
+            return {"result": msg}
 
         if cmd == "reload":
             log.info("Reload requested — not yet implemented")

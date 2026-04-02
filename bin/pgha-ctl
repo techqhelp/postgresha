@@ -104,6 +104,8 @@ def cmd_status(args) -> None:
     │    Memory:     {str(os_s.get('mem_pct', 'N/A')) + '%':<44}│
     │    Disk:       {str(os_s.get('disk_pct', 'N/A')) + '%':<44}│
     │    Degraded:   {str(os_s.get('degraded', 'N/A')):<44}│
+    ├─────────────────────────────────────────────────────────────┤
+    │  MAINTENANCE:  {'⚠ ENABLED — failover/switchover blocked' if resp.get('maintenance') else 'disabled':<44}│
     └─────────────────────────────────────────────────────────────┘
     """).strip())
 
@@ -123,6 +125,33 @@ def cmd_switchover(args) -> None:
         sys.exit(1)
     print(f"Switchover initiated: {resp.get('result', resp)}")
     print("Monitor progress with: pgha-ctl status")
+
+
+def cmd_maintenance(args) -> None:
+    action = args.action
+    if action == "on":
+        resp = _send(args.socket, {"cmd": "maintenance_on"})
+    elif action == "off":
+        resp = _send(args.socket, {"cmd": "maintenance_off"})
+    elif action == "status":
+        resp = _send(args.socket, {"cmd": "status"})
+        if "error" in resp:
+            print(f"ERROR: {resp['error']}", file=sys.stderr)
+            sys.exit(1)
+        if resp.get("maintenance"):
+            print("Maintenance mode: ENABLED")
+        else:
+            print("Maintenance mode: disabled")
+        return
+    else:
+        print(f"ERROR: unknown action '{action}'. Use: on, off, status",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if "error" in resp:
+        print(f"ERROR: {resp['error']}", file=sys.stderr)
+        sys.exit(1)
+    print(resp.get("result", resp))
 
 
 def main() -> None:
@@ -155,6 +184,16 @@ def main() -> None:
         "--force", "-f", action="store_true",
         help="Skip confirmation prompt")
     p_sw.set_defaults(func=cmd_switchover)
+
+    # --- maintenance ------------------------------------------------------
+    p_maint = subparsers.add_parser(
+        "maintenance",
+        help="Enable/disable maintenance mode (blocks failover & switchover)")
+    p_maint.add_argument(
+        "action",
+        choices=["on", "off", "status"],
+        help="on = enable, off = disable, status = check current state")
+    p_maint.set_defaults(func=cmd_maintenance)
 
     args = parser.parse_args()
     args.func(args)
