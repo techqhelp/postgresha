@@ -328,9 +328,23 @@ class DiskManager:
         self._wait_for_device(dev_path, timeout=30)
 
         if self._is_mounted(mount_pt):
-            log.info("Filesystem already mounted at %s — skipping mount",
-                     mount_pt)
-            return
+            # Verify the mount is healthy — a stale mount from a previous
+            # disk detach/re-attach cycle will return I/O errors.
+            if self._is_mount_healthy(mount_pt):
+                log.info("Filesystem already mounted at %s — skipping mount",
+                         mount_pt)
+                return
+            else:
+                log.warning("Stale mount detected at %s — force unmounting "
+                            "before remount", mount_pt)
+                try:
+                    subprocess.run(
+                        ["umount", "-f", "-l", mount_pt],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        universal_newlines=True, timeout=30,
+                    )
+                except Exception as exc:
+                    log.warning("umount -f -l %s failed: %s", mount_pt, exc)
 
         # Create mount point directory if it does not exist
         if not os.path.exists(mount_pt):
@@ -358,23 +372,45 @@ class DiskManager:
         log.info("Disk mounted successfully at %s", mount_pt)
 
     def unmount_disk(self) -> None:
-        """Unmount the RPD filesystem."""
+        """Unmount the RPD filesystem.
+
+        Uses umount -f first; if that fails (e.g. device busy because PG
+        processes still hold open fds), falls back to umount -f -l (lazy)
+        which detaches the mount from the namespace immediately and cleans
+        up once all references are gone.  This prevents stale mounts that
+        cause I/O errors on the next attach cycle.
+        """
         mount_pt = self._cfg.gcp.disk_mount_point
         if not self._is_mounted(mount_pt):
             log.info("Filesystem not mounted at %s — skipping umount", mount_pt)
             return
 
+        # Attempt 1: normal force-unmount
         cmd = ["umount", "-f", mount_pt]
         log.info("Unmounting: %s", " ".join(cmd))
         result = subprocess.run(
             cmd,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            universal_newlines=True,
+            universal_newlines=True, timeout=30,
         )
-        if result.returncode != 0:
+        if result.returncode == 0:
+            log.info("Filesystem unmounted from %s", mount_pt)
+            return
+
+        # Attempt 2: lazy unmount — detach mount immediately, clean up later
+        log.warning("umount -f failed (%s) — falling back to lazy unmount",
+                    result.stderr.strip())
+        cmd_lazy = ["umount", "-f", "-l", mount_pt]
+        log.info("Unmounting (lazy): %s", " ".join(cmd_lazy))
+        result_lazy = subprocess.run(
+            cmd_lazy,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, timeout=30,
+        )
+        if result_lazy.returncode != 0:
             raise RuntimeError(
-                "umount failed: {}".format(result.stderr.strip()))
-        log.info("Filesystem unmounted from %s", mount_pt)
+                "umount -f -l failed: {}".format(result_lazy.stderr.strip()))
+        log.info("Filesystem lazy-unmounted from %s", mount_pt)
 
     # ------------------------------------------------------------------
     # PostgreSQL start / stop
@@ -544,6 +580,19 @@ class DiskManager:
                 if len(parts) >= 2 and parts[1] == mount_pt:
                     return True
         return False
+
+    def _is_mount_healthy(self, mount_pt: str) -> bool:
+        """Return True if the mount point is accessible (not a stale mount).
+
+        A stale mount occurs when the underlying block device was detached
+        and re-attached but the old mount entry still exists in /proc/mounts.
+        Accessing a stale mount produces errno 5 (EIO / Input/output error).
+        """
+        try:
+            os.listdir(mount_pt)
+            return True
+        except OSError:
+            return False
 
     def _wait_for_device(self, dev_path: str, timeout: int = 30) -> None:
         deadline = time.monotonic() + timeout

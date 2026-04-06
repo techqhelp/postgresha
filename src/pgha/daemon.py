@@ -171,20 +171,47 @@ class PgHaDaemon:
             log.warning("Failed to start EFM service %s: %s", svc, exc)
 
     def _efm_stop(self) -> None:
-        """Stop EFM service (when demoting from PRIMARY)."""
+        """Stop EFM service (when demoting from PRIMARY).
+
+        EFM (Java process) may hold open file handles on the data disk
+        mount point.  We must ensure it is fully stopped before unmount,
+        otherwise umount fails with 'device busy' and leaves a stale
+        mount that causes I/O errors on the next failover cycle.
+        """
         if not self._cfg.efm.enabled:
             return
         svc = self._cfg.efm.service_name
         log.info("Stopping EFM service: %s", svc)
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["systemctl", "stop", svc],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=30,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, timeout=30,
             )
+            if result.returncode != 0:
+                log.warning("systemctl stop %s returned %d: %s",
+                            svc, result.returncode, result.stderr.strip())
         except Exception as exc:
             log.warning("Failed to stop EFM service %s: %s", svc, exc)
+
+        # Verify the service is actually inactive — systemctl stop can
+        # return before the Java process fully exits.
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", svc],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                universal_newlines=True, timeout=10,
+            )
+            if result.stdout.strip() == "active":
+                log.warning("EFM service %s still active after stop — "
+                            "killing remaining processes", svc)
+                subprocess.run(
+                    ["systemctl", "kill", "-s", "SIGKILL", svc],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+        except Exception as exc:
+            log.warning("EFM post-stop check failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -372,6 +399,73 @@ class PgHaDaemon:
         if result:
             self._efm_start()
 
+    def _kill_mount_users(self, mount_pt: str) -> None:
+        """Kill non-system processes that have open files under mount_pt.
+
+        IMPORTANT: Do NOT use 'fuser -km <mount_pt>' — on a mount point
+        it matches every process whose root/cwd traverses through it,
+        including PID 1 (systemd) and kernel threads, which would crash
+        the entire server.
+
+        Scans /proc/[pid]/fd symlinks to find processes with open files
+        whose path starts with mount_pt.  Only kills PIDs > 1000 to
+        avoid system processes.  Requires no external tools (lsof/fuser).
+        """
+        mount_pt_slash = mount_pt.rstrip("/") + "/"
+        pids_to_kill = set()
+
+        try:
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                pid = int(entry)
+                if pid <= 1000:
+                    continue  # skip system/kernel processes
+
+                # Check cwd and root first — EFM may have cwd on mount
+                proc_path = f"/proc/{pid}"
+                try:
+                    for link in ("cwd", "root"):
+                        target = os.readlink(f"{proc_path}/{link}")
+                        if target.startswith(mount_pt_slash) or target == mount_pt.rstrip("/"):
+                            pids_to_kill.add(pid)
+                            break
+                except OSError:
+                    pass
+
+                if pid in pids_to_kill:
+                    continue
+
+                # Check open file descriptors
+                fd_dir = f"{proc_path}/fd"
+                try:
+                    for fd in os.listdir(fd_dir):
+                        try:
+                            target = os.readlink(f"{fd_dir}/{fd}")
+                            if target.startswith(mount_pt_slash) or target == mount_pt.rstrip("/"):
+                                pids_to_kill.add(pid)
+                                break
+                        except OSError:
+                            continue
+                except (OSError, PermissionError):
+                    continue
+        except Exception as exc:
+            log.warning("Failed to scan /proc for mount users: %s", exc)
+            return
+
+        if not pids_to_kill:
+            log.debug("No user-space processes with open files on %s", mount_pt)
+            return
+
+        import signal
+        log.info("Killing %d processes with open files on %s: %s",
+                 len(pids_to_kill), mount_pt, pids_to_kill)
+        for pid in pids_to_kill:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass  # already dead or permission denied
+
     def _self_demote_after_pg_failure(self) -> None:
         """
         Primary demotes itself when PG fails unrecoverably:
@@ -384,10 +478,12 @@ class PgHaDaemon:
 
         log.warning("Self-demoting PRIMARY after PostgreSQL failure …")
         self._efm_stop()
+        mount_pt = self._cfg.gcp.disk_mount_point
         for action, fn in [
             ("release_vip",     self._net_mgr.release_vip),       # IP first — stop clients connecting to dying node
             ("stop_postgres",   lambda: self._disk_mgr.stop_postgres("immediate")),
-            ("unmount_disk",    self._disk_mgr.unmount_disk),
+            ("kill_mount_users", lambda: self._kill_mount_users(mount_pt)),  # kill EFM / any process on mount
+            ("unmount_disk",    self._disk_mgr.unmount_disk),     # must succeed before detach to avoid stale mount
             ("detach_disk",     self._disk_mgr.detach_disk),
         ]:
             try:
