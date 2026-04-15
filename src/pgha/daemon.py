@@ -133,22 +133,54 @@ class PgHaDaemon:
         """Return True if the maintenance flag file exists."""
         return os.path.isfile(self._cfg.cluster.maintenance_file)
 
-    def _enter_maintenance(self) -> str:
-        """Create the maintenance flag file. Returns status message."""
+    def _enter_maintenance(self, propagate: bool = True) -> str:
+        """Create the maintenance flag file. Returns status message.
+
+        If *propagate* is True (default — CLI-initiated), also notify the
+        peer node over TCP so both nodes enter maintenance together.
+        """
         path = self._cfg.cluster.maintenance_file
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
             f.write(time.strftime("%Y-%m-%dT%H:%M:%S"))
         log.warning("MAINTENANCE MODE ENABLED — failover/switchover suppressed")
+        if propagate:
+            self._send_maintenance_to_peer("MAINTENANCE_ON")
         return "maintenance mode enabled"
 
-    def _exit_maintenance(self) -> str:
-        """Remove the maintenance flag file. Returns status message."""
+    def _exit_maintenance(self, propagate: bool = True) -> str:
+        """Remove the maintenance flag file. Returns status message.
+
+        If *propagate* is True (default — CLI-initiated), also notify the
+        peer node over TCP so both nodes exit maintenance together.
+        """
         path = self._cfg.cluster.maintenance_file
         if os.path.isfile(path):
             os.remove(path)
         log.info("MAINTENANCE MODE DISABLED — normal HA operation resumed")
+        if propagate:
+            self._send_maintenance_to_peer("MAINTENANCE_OFF")
         return "maintenance mode disabled"
+
+    def _send_maintenance_to_peer(self, cmd: str) -> None:
+        """Send MAINTENANCE_ON or MAINTENANCE_OFF to the peer via TCP."""
+        peer_ip = self._cfg.cluster.peer_ip
+        log.info("Sending %s to peer %s:%d", cmd, peer_ip, _PEER_PORT)
+        payload = {"cmd": cmd}
+        if self._cfg.cluster.peer_auth_token:
+            payload["token"] = self._cfg.cluster.peer_auth_token
+        msg = json.dumps(payload).encode()
+        try:
+            with socket.create_connection((peer_ip, _PEER_PORT), timeout=10) as sock:
+                sock.sendall(msg + b"\n")
+                resp_raw = sock.recv(256).decode().strip()
+                resp = json.loads(resp_raw)
+                if resp.get("result") == "ok":
+                    log.info("Peer acknowledged %s", cmd)
+                else:
+                    log.warning("Unexpected peer response for %s: %s", cmd, resp)
+        except Exception as exc:
+            log.warning("Failed to send %s to peer: %s (peer may be down)", cmd, exc)
 
     # ------------------------------------------------------------------
     # EFM service management
@@ -638,6 +670,18 @@ class PgHaDaemon:
                             name="pg-fail-failover",
                             daemon=True,
                         ).start()
+
+            elif cmd == "MAINTENANCE_ON":
+                self._enter_maintenance(propagate=False)
+                conn.sendall(
+                    json.dumps({"result": "ok"}).encode() + b"\n")
+                log.info("MAINTENANCE_ON from peer %s — maintenance enabled locally", addr)
+
+            elif cmd == "MAINTENANCE_OFF":
+                self._exit_maintenance(propagate=False)
+                conn.sendall(
+                    json.dumps({"result": "ok"}).encode() + b"\n")
+                log.info("MAINTENANCE_OFF from peer %s — maintenance disabled locally", addr)
 
             else:
                 conn.sendall(
