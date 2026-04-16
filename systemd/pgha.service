@@ -21,11 +21,7 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=pgha
 
-# Runtime directories
-RuntimeDirectory=pgha
-RuntimeDirectoryMode=0750
-
-# Ensure log directory exists
+# Ensure runtime and log directories exist
 ExecStartPre=/usr/bin/install -d -o root -g root -m 0755 /var/log/pgha
 ExecStartPre=/usr/bin/install -d -o root -g root -m 0750 /var/run/pgha
 

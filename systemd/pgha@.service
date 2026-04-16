@@ -21,11 +21,9 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=pgha-%i
 
-# Runtime directories
-RuntimeDirectory=pgha
-RuntimeDirectoryMode=0750
-
-# Ensure log directory exists
+# Ensure runtime and log directories exist
+# NOTE: Do NOT use RuntimeDirectory=pgha here — systemd would delete
+# /var/run/pgha/ when ANY cluster instance stops, wiping other clusters' sockets.
 ExecStartPre=/usr/bin/install -d -o root -g root -m 0755 /var/log/pgha
 ExecStartPre=/usr/bin/install -d -o root -g root -m 0750 /var/run/pgha
 

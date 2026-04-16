@@ -695,37 +695,47 @@ class PgHaDaemon:
         if os.path.exists(sock_path):
             os.unlink(sock_path)
 
+        # Bind in the main thread so errors are visible immediately
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            srv.bind(sock_path)
+        except OSError as exc:
+            log.error("Failed to bind management socket at %s: %s",
+                      sock_path, exc)
+            srv.close()
+            return
+        os.chmod(sock_path, 0o600)
+        srv.listen(5)
+        srv.settimeout(1.0)
+
         self._mgmt_thread = threading.Thread(
             target=self._mgmt_server_loop,
+            args=(srv,),
             name="mgmt-api",
             daemon=True,
         )
         self._mgmt_thread.start()
         log.info("Management API listening on %s", sock_path)
 
-    def _mgmt_server_loop(self) -> None:
+    def _mgmt_server_loop(self, srv: socket.socket) -> None:
         """Accept and handle management API connections."""
-        sock_path = self._cfg.api.socket_path
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(sock_path)
-        os.chmod(sock_path, 0o600)
-        srv.listen(5)
-        srv.settimeout(1.0)
-
-        while not self._stop_evt.is_set():
-            try:
-                conn, _ = srv.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            threading.Thread(
-                target=self._handle_mgmt_conn,
-                args=(conn,),
-                daemon=True,
-            ).start()
-
-        srv.close()
+        try:
+            while not self._stop_evt.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                threading.Thread(
+                    target=self._handle_mgmt_conn,
+                    args=(conn,),
+                    daemon=True,
+                ).start()
+        except Exception as exc:
+            log.error("Management API loop crashed: %s", exc)
+        finally:
+            srv.close()
 
     def _handle_mgmt_conn(self, conn: socket.socket) -> None:
         with conn:
