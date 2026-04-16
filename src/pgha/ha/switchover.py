@@ -52,8 +52,6 @@ _CMD_SWITCHOVER_REQUEST = "SWITCHOVER_REQUEST"
 _CMD_SWITCHOVER_ACCEPT  = "SWITCHOVER_ACCEPT"
 _CMD_SWITCHOVER_DONE    = "SWITCHOVER_DONE"
 
-# Port used for management TCP commands (separate from heartbeat UDP)
-_MGMT_PORT = 7778
 _MGMT_TIMEOUT_SECS = 30
 
 
@@ -193,17 +191,18 @@ class SwitchoverEngine:
     def _step_pre_check(self) -> None:
         """Verify peer is reachable via TCP before starting the hand-off."""
         peer_ip   = self._cfg.cluster.peer_ip
+        peer_port = self._cfg.cluster.peer_port
         deadline  = time.monotonic() + _MGMT_TIMEOUT_SECS
         while time.monotonic() < deadline:
             try:
                 with socket.create_connection(
-                        (peer_ip, _MGMT_PORT), timeout=3):
+                        (peer_ip, peer_port), timeout=3):
                     log.info("Pre-check: peer %s is reachable", peer_ip)
                     return
             except OSError:
                 time.sleep(2)
         raise RuntimeError(
-            f"Pre-check failed: peer {peer_ip}:{_MGMT_PORT} not reachable")
+            f"Pre-check failed: peer {peer_ip}:{peer_port} not reachable")
 
     def _step_stop_postgres(self) -> None:
         self._disk_mgr.stop_postgres(mode="fast")
@@ -226,14 +225,15 @@ class SwitchoverEngine:
     def _step_signal_peer(self) -> None:
         """Send SWITCHOVER_REQUEST to the standby node over TCP."""
         peer_ip  = self._cfg.cluster.peer_ip
+        peer_port = self._cfg.cluster.peer_port
         payload  = {"cmd": _CMD_SWITCHOVER_REQUEST}
         if self._cfg.cluster.peer_auth_token:
             payload["token"] = self._cfg.cluster.peer_auth_token
         msg      = json.dumps(payload).encode()
         log.info("Sending %s to peer %s:%d",
-                 _CMD_SWITCHOVER_REQUEST, peer_ip, _MGMT_PORT)
+                 _CMD_SWITCHOVER_REQUEST, peer_ip, peer_port)
         with socket.create_connection(
-                (peer_ip, _MGMT_PORT), timeout=_MGMT_TIMEOUT_SECS) as sock:
+                (peer_ip, peer_port), timeout=_MGMT_TIMEOUT_SECS) as sock:
             sock.sendall(msg + b"\n")
             # Wait for acknowledgement
             resp_raw = sock.recv(256)

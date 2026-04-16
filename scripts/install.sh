@@ -99,11 +99,15 @@ fi
 # --------------------------------------------------------------------------
 # Step 5 — Install systemd unit
 # --------------------------------------------------------------------------
-section "Installing systemd unit"
+section "Installing systemd units"
 
 install -m 644 "${PROJECT_DIR}/systemd/pgha.service" \
     /etc/systemd/system/pgha.service
 info "Installed: /etc/systemd/system/pgha.service"
+
+install -m 644 "${PROJECT_DIR}/systemd/pgha@.service" \
+    /etc/systemd/system/pgha@.service
+info "Installed: /etc/systemd/system/pgha@.service  (template unit for multi-cluster)"
 
 # --------------------------------------------------------------------------
 # Step 6 — Create runtime directories
@@ -168,4 +172,13 @@ echo ""
 echo "  Start pg-standby BEFORE pg-primary."
 echo "  Check status:  pgha-ctl status"
 echo "  Live log:      sudo journalctl -u pgha -f"
+echo ""
+echo "  --- MULTI-CLUSTER SETUP ---"
+echo "  To run multiple DB clusters on the same pair of VMs:"
+echo ""
+echo "    1. Copy /etc/pgha/pgha.conf to /etc/pgha/pgha-<name>.conf"
+echo "    2. Edit each config: unique ports, disk, VIP, data_dir, socket, log, etc."
+echo "    3. Start with:  systemctl enable pgha@<name>"
+echo "                    systemctl start  pgha@<name>"
+echo "    4. Manage with: pgha-ctl --config /etc/pgha/pgha-<name>.conf status"
 echo ""

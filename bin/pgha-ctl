@@ -9,9 +9,13 @@ Usage examples:
     pgha-ctl status --json
     pgha-ctl switchover
     pgha-ctl switchover --force
+
+    # Multi-cluster: target a specific cluster by its config file
+    pgha-ctl --config /etc/pgha/pgha-cluster2.conf status
 """
 
 import argparse
+import configparser
 import json
 import os
 import socket
@@ -22,6 +26,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 DEFAULT_SOCKET = "/var/run/pgha/pgha.sock"
 DEFAULT_CONFIG = "/etc/pgha/pgha.conf"
+
+
+def _socket_from_config(cfg_path: str) -> str:
+    """Read the api.socket_path from a pgha config file."""
+    p = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+    p.read(cfg_path)
+    return p.get("api", "socket_path", fallback=DEFAULT_SOCKET)
 
 
 def _send(sock_path: str, payload: dict) -> dict:
@@ -161,9 +172,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--socket", "-s",
-        default=DEFAULT_SOCKET,
+        default=None,
         metavar="SOCK",
-        help=f"Unix socket path (default: {DEFAULT_SOCKET})",
+        help=f"Unix socket path (default: read from config or {DEFAULT_SOCKET})",
+    )
+    parser.add_argument(
+        "--config", "-c",
+        default=None,
+        metavar="FILE",
+        help="Path to pgha.conf — socket path is read from [api] section. "
+             "Use this to target a specific cluster.",
     )
 
     subparsers = parser.add_subparsers(dest="command")
@@ -196,6 +214,14 @@ def main() -> None:
     p_maint.set_defaults(func=cmd_maintenance)
 
     args = parser.parse_args()
+
+    # Resolve socket path: explicit --socket wins, else read from --config
+    if args.socket is None:
+        if args.config:
+            args.socket = _socket_from_config(args.config)
+        else:
+            args.socket = DEFAULT_SOCKET
+
     args.func(args)
 
 

@@ -68,8 +68,9 @@ sudo systemctl start pgha
 | Two Compute Engine VMs | Same region, different zones (e.g., `us-central1-a`, `us-central1-b`) |
 | Regional Persistent Disk | Created in the same region, formatted XFS or EXT4 |
 | VPC Subnet | Both VMs in the same subnet; VIP address (`10.0.0.100`) must be within the subnet CIDR |
-| Firewall rule | Allow UDP port **7777** between the two VM internal IPs |
+| Firewall rule | Allow UDP port **7777** between the two VM internal IPs (heartbeat) |
 | Firewall rule | Allow TCP port **7778** between the two VM internal IPs (switchover + PG fail handoff) |
+| Firewall rule (multi-cluster) | Additional UDP/TCP port pairs for each extra cluster (e.g., 7779/7780, 7781/7782) |
 | IAM / Service Account | Compute Instance Admin or custom role (see step 2) |
 
 ### Both VMs
@@ -220,7 +221,7 @@ The script will:
 - Install the pgha Python package via `setup.py`
 - Copy binaries to `/usr/bin/pgha-daemon` and `/usr/bin/pgha-ctl`
 - Install `/etc/pgha/pgha.conf` (only if not already present)
-- Install `/etc/systemd/system/pgha.service`
+- Install `/etc/systemd/system/pgha.service` and `/etc/systemd/system/pgha@.service` (template unit for multi-cluster)
 - Create `/var/log/pgha/` and `/var/run/pgha/`
 - Disable and stop the built-in `edb-as-15` service
 - Reload systemd
@@ -241,6 +242,7 @@ node_name   = pg-primary
 peer_node   = pg-standby
 peer_ip     = 10.0.0.3          # ← pg-standby's internal private IP
 heartbeat_port    = 7777
+peer_port         = 7778        # TCP port for inter-node commands
 heartbeat_interval = 1
 dead_interval = 5
 fence_wait    = 3          # brief settle after fence; GCP API is synchronous
@@ -342,9 +344,13 @@ gcloud compute firewall-rules create pgha-heartbeat \
   --action=ALLOW \
   --rules=udp:7777,tcp:7778 \
   --source-ranges=10.0.0.0/24 \
-  --description="pgha inter-node: heartbeat (UDP 7777), peer commands (TCP 7778: switchover + PG fail handoff)" \
+  --description="pgha inter-node: heartbeat (UDP 7777), peer commands (TCP 7778)" \
   --project=my-gcp-project
 ```
+
+> **Multi-cluster**: if running additional clusters, open their ports too
+> (e.g., `udp:7779,tcp:7780` for cluster 2). You can add them to the same
+> firewall rule or create separate rules per cluster.
 
 ---
 
@@ -598,6 +604,21 @@ sudo journalctl -u pgha -f
 sudo tail -200 /var/log/pgha/pgha.log
 ```
 
+### Multi-cluster commands
+
+```bash
+# Target a specific cluster via its config file
+pgha-ctl --config /etc/pgha/pgha-cluster2.conf status
+pgha-ctl --config /etc/pgha/pgha-cluster2.conf switchover
+pgha-ctl --config /etc/pgha/pgha-cluster2.conf maintenance on
+
+# Manage multi-cluster systemd services
+sudo systemctl start  pgha@cluster2
+sudo systemctl stop   pgha@cluster2
+sudo systemctl status pgha@cluster2
+sudo journalctl -u pgha@cluster2 -f
+```
+
 ---
 
 ## Troubleshooting
@@ -671,9 +692,124 @@ sudo chown -R enterprisedb:enterprisedb /pgdata
 
 | File | Server Path | Purpose |
 |---|---|---|
-| `conf/pgha.conf` | `/etc/pgha/pgha.conf` | Main configuration |
+| `conf/pgha.conf` | `/etc/pgha/pgha.conf` | Main configuration (single cluster) |
+| `conf/pgha.conf` | `/etc/pgha/pgha-<name>.conf` | Per-cluster config (multi-cluster) |
 | `bin/pgha-daemon` | `/usr/bin/pgha-daemon` | Background daemon |
 | `bin/pgha-ctl` | `/usr/bin/pgha-ctl` | CLI management tool |
-| `systemd/pgha.service` | `/etc/systemd/system/pgha.service` | Systemd unit |
+| `systemd/pgha.service` | `/etc/systemd/system/pgha.service` | Systemd unit (single cluster) |
+| `systemd/pgha@.service` | `/etc/systemd/system/pgha@.service` | Systemd template unit (multi-cluster) |
 | *(runtime)* | `/var/log/pgha/pgha.log` | Daemon log file |
 | *(runtime)* | `/var/run/pgha/pgha.sock` | Unix socket for pgha-ctl |
+
+---
+
+## Multi-Cluster Setup
+
+pgha supports running **multiple independent DB clusters** on the same pair of VMs. Each cluster gets its own daemon instance, config file, disk, VIP, and ports.
+
+### Architecture (2 clusters example)
+
+```
+┌───────────────────────────────────┐    ┌───────────────────────────────────┐
+│  pg-primary  (zone-a)           │    │  pg-standby  (zone-b)           │
+│                                   │    │                                   │
+│  pgha@cluster1  (PRIMARY)         │    │  pgha@cluster1  (STANDBY)        │
+│    UDP :7777  TCP :7778           │    │    monitoring heartbeat            │
+│    RPD: pg-disk-1  VIP: .100      │    │                                   │
+│    PG port: 5444                  │    │                                   │
+│                                   │    │                                   │
+│  pgha@cluster2  (PRIMARY)         │    │  pgha@cluster2  (STANDBY)        │
+│    UDP :7779  TCP :7780           │    │    monitoring heartbeat            │
+│    RPD: pg-disk-2  VIP: .101      │    │                                   │
+│    PG port: 5445                  │    │                                   │
+└───────────────────────────────────┘    └───────────────────────────────────┘
+```
+
+Each cluster is **fully independent** — separate failover, switchover, and maintenance mode.
+
+### Step 1 — Create a per-cluster config file
+
+Copy the default config and edit for the new cluster:
+
+```bash
+sudo cp /etc/pgha/pgha.conf /etc/pgha/pgha-cluster2.conf
+sudo vi /etc/pgha/pgha-cluster2.conf
+```
+
+**Settings that MUST be unique per cluster:**
+
+| Setting | Cluster 1 (default) | Cluster 2 |
+|---|---|---|
+| `[cluster] name` | `pg-ha-cluster` | `pg-ha-cluster2` |
+| `[cluster] heartbeat_port` | `7777` | `7779` |
+| `[cluster] peer_port` | `7778` | `7780` |
+| `[cluster] maintenance_file` | `/var/run/pgha/maintenance` | `/var/run/pgha/cluster2.maint` |
+| `[gcp] disk_name` | `pg-regional-disk` | `pg-regional-disk-2` |
+| `[gcp] disk_device_name` | `pg-data-disk` | `pg-data-disk-2` |
+| `[gcp] disk_mount_point` | `/pgdata` | `/pgdata2` |
+| `[gcp] vip_address` | `10.0.0.100` | `10.0.0.101` |
+| `[gcp] vip_cidr` | `10.0.0.100/32` | `10.0.0.101/32` |
+| `[postgresql] port` | `5444` | `5445` |
+| `[postgresql] data_dir` | `/pgdata/as15/data` | `/pgdata2/as15/data` |
+| `[logging] file` | `/var/log/pgha/pgha.log` | `/var/log/pgha/cluster2.log` |
+| `[api] socket_path` | `/var/run/pgha/pgha.sock` | `/var/run/pgha/cluster2.sock` |
+| `[efm] service_name` | `edb-efm-4.7` | `edb-efm-cluster2` |
+
+> `node_name`, `peer_node`, `peer_ip`, zones, and instance names stay the same
+> (same two VMs host all clusters).
+
+### Step 2 — Provision GCP resources for the new cluster
+
+```bash
+# Create a second Regional Persistent Disk
+gcloud compute disks create pg-regional-disk-2 \
+  --type=pd-ssd \
+  --size=100GB \
+  --region=us-central1 \
+  --replica-zones=us-central1-a,us-central1-b \
+  --project=my-gcp-project
+
+# Add a second alias IP to the primary's NIC
+gcloud compute instances network-interfaces update pg-primary \
+  --zone=us-central1-a \
+  --aliases="10.0.0.100/32,10.0.0.101/32" \
+  --project=my-gcp-project
+
+# Open firewall ports for cluster 2
+gcloud compute firewall-rules update pgha-heartbeat \
+  --rules=udp:7777,tcp:7778,udp:7779,tcp:7780 \
+  --project=my-gcp-project
+```
+
+Format and initialize the second disk (same as Step 1 in the main guide, using `/pgdata2`).
+
+### Step 3 — Start the cluster
+
+```bash
+# On pg-standby first, then pg-primary
+sudo systemctl enable pgha@cluster2
+sudo systemctl start pgha@cluster2
+```
+
+The template unit `pgha@cluster2.service` reads `/etc/pgha/pgha-cluster2.conf` automatically.
+
+### Step 4 — Manage the cluster
+
+```bash
+# Status
+pgha-ctl --config /etc/pgha/pgha-cluster2.conf status
+
+# Switchover
+pgha-ctl --config /etc/pgha/pgha-cluster2.conf switchover
+
+# Maintenance mode
+pgha-ctl --config /etc/pgha/pgha-cluster2.conf maintenance on
+pgha-ctl --config /etc/pgha/pgha-cluster2.conf maintenance off
+
+# Logs
+sudo journalctl -u pgha@cluster2 -f
+sudo tail -f /var/log/pgha/cluster2.log
+```
+
+> **Note**: Each cluster's failover, switchover, and maintenance mode are fully independent.
+> Putting cluster1 in maintenance does NOT affect cluster2.

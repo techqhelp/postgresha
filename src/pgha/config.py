@@ -20,6 +20,7 @@ class ClusterCfg:
     peer_node: str
     peer_ip: str
     heartbeat_port: int
+    peer_port: int
     heartbeat_interval: float
     dead_interval: float
     quorum_timeout: float
@@ -137,6 +138,7 @@ def load(path: str = DEFAULT_CFG) -> Config:
         peer_node=_get("cluster", "peer_node"),
         peer_ip=_get("cluster", "peer_ip"),
         heartbeat_port=int(_get("cluster", "heartbeat_port", fallback=7777)),
+        peer_port=int(_get("cluster", "peer_port", fallback=7778)),
         heartbeat_interval=float(_get("cluster", "heartbeat_interval", fallback=1)),
         dead_interval=float(_get("cluster", "dead_interval", fallback=5)),
         quorum_timeout=float(_get("cluster", "quorum_timeout", fallback=10)),

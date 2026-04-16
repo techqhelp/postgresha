@@ -61,9 +61,6 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_CFG = "/etc/pgha/pgha.conf"
 _EVENT_QUEUE_SIZE = 256
-# TCP port for inter-node commands (SWITCHOVER_REQUEST, PG_FAIL_HANDOFF).
-# Must be open between the two nodes in GCP firewall rules.
-_PEER_PORT = 7778
 
 
 def _setup_logging(lcfg) -> None:
@@ -165,13 +162,13 @@ class PgHaDaemon:
     def _send_maintenance_to_peer(self, cmd: str) -> None:
         """Send MAINTENANCE_ON or MAINTENANCE_OFF to the peer via TCP."""
         peer_ip = self._cfg.cluster.peer_ip
-        log.info("Sending %s to peer %s:%d", cmd, peer_ip, _PEER_PORT)
+        log.info("Sending %s to peer %s:%d", cmd, peer_ip, self._cfg.cluster.peer_port)
         payload = {"cmd": cmd}
         if self._cfg.cluster.peer_auth_token:
             payload["token"] = self._cfg.cluster.peer_auth_token
         msg = json.dumps(payload).encode()
         try:
-            with socket.create_connection((peer_ip, _PEER_PORT), timeout=10) as sock:
+            with socket.create_connection((peer_ip, self._cfg.cluster.peer_port), timeout=10) as sock:
                 sock.sendall(msg + b"\n")
                 resp_raw = sock.recv(256).decode().strip()
                 resp = json.loads(resp_raw)
@@ -557,12 +554,12 @@ class PgHaDaemon:
     def _send_pg_fail_handoff(self) -> None:
         """Send PG_FAIL_HANDOFF to peer via TCP, triggering its FailoverEngine."""
         peer_ip = self._cfg.cluster.peer_ip
-        log.info("Sending PG_FAIL_HANDOFF to peer %s:%d", peer_ip, _PEER_PORT)
+        log.info("Sending PG_FAIL_HANDOFF to peer %s:%d", peer_ip, self._cfg.cluster.peer_port)
         payload = {"cmd": "PG_FAIL_HANDOFF"}
         if self._cfg.cluster.peer_auth_token:
             payload["token"] = self._cfg.cluster.peer_auth_token
         msg = json.dumps(payload).encode()
-        with socket.create_connection((peer_ip, _PEER_PORT), timeout=10) as sock:
+        with socket.create_connection((peer_ip, self._cfg.cluster.peer_port), timeout=10) as sock:
             sock.sendall(msg + b"\n")
             resp_raw = sock.recv(256).decode().strip()
             resp = json.loads(resp_raw)
@@ -573,7 +570,7 @@ class PgHaDaemon:
 
     # ------------------------------------------------------------------
     # Peer TCP server  (inter-node: SWITCHOVER_REQUEST / PG_FAIL_HANDOFF)
-    # Port 7778 — must be open in GCP firewall between both node IPs.
+    # Port configured via cluster.peer_port — must be open in GCP firewall.
     # ------------------------------------------------------------------
 
     def _start_peer_server(self) -> None:
@@ -583,12 +580,12 @@ class PgHaDaemon:
             daemon=True,
         )
         self._peer_thread.start()
-        log.info("Peer TCP server listening on 0.0.0.0:%d", _PEER_PORT)
+        log.info("Peer TCP server listening on 0.0.0.0:%d", self._cfg.cluster.peer_port)
 
     def _peer_server_loop(self) -> None:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("0.0.0.0", _PEER_PORT))
+        srv.bind(("0.0.0.0", self._cfg.cluster.peer_port))
         srv.listen(5)
         srv.settimeout(1.0)
         while not self._stop_evt.is_set():
