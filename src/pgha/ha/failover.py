@@ -255,45 +255,45 @@ class FailoverEngine:
 
     def _step_fence_wait(self) -> None:
         """
-        Wait until GCP confirms the disk is free after fence.
+        Brief settling wait after fence.
 
-        The naive approach (sleep cfg.cluster.fence_wait) fails when the
-        GCP regional disk metadata takes longer to propagate across zones
-        than the fixed wait.  Instead, sleep the configured minimum and
-        then poll current_rw_holder() until the disk shows as free or a
-        hard timeout (60s) expires.  This completely eliminates the
-        RESOURCE_IN_USE race on ATTACH.
+        GCP's operation.result() already confirmed the detach synchronously,
+        so this is just a small buffer for hypervisor propagation.
         """
-        min_wait = self._cfg.cluster.fence_wait
-        my_name  = self._cfg.cluster.node_name
-        timeout  = 60  # hard ceiling
-
-        log.info("Fence settle: sleeping %.0fs then polling disk availability "
-                 "(timeout %ds)", min_wait, timeout)
-        time.sleep(min_wait)
-
-        deadline = time.monotonic() + timeout - min_wait
-        poll_interval = 2.0
-        while time.monotonic() < deadline:
-            holder = self._disk_mgr.current_rw_holder()
-            if holder is None or holder == my_name:
-                log.info("Fence settle: disk is free (holder=%s) — proceeding",
-                         holder)
-                return
-            log.info("Fence settle: disk still held by %s — waiting %.0fs",
-                     holder, poll_interval)
-            time.sleep(poll_interval)
-
-        # Timeout — proceed anyway; attach_disk_rw uses forceAttach=true
-        # which may still succeed once the GCP metadata catches up.
-        log.warning("Fence settle: timeout reached, disk may still be held — "
-                    "proceeding with forceAttach")
+        wait = self._cfg.cluster.fence_wait
+        log.info("Fence settle wait: %.0f seconds", wait)
+        time.sleep(wait)
 
     def _step_attach_disk(self) -> None:
-        self._disk_mgr.attach_disk_rw()
-        self._local.set_disk_state(DiskState.ATTACHED_RW)
-        self._emit(HaEventType.DISK_ATTACHED,
-                   f"RPD attached to {self._cfg.cluster.node_name} in RW mode")
+        """
+        Attach the RPD in READ_WRITE mode, with retries.
+
+        attach_disk_rw() uses forceAttach=true, but GCP can still return
+        RESOURCE_IN_USE if the regional disk metadata hasn't propagated
+        the prior detach.  Retry with exponential back-off instead of
+        polling the eventually-consistent regional disk API beforehand.
+        """
+        max_attempts = 5
+        backoff = 3  # seconds; doubles each retry
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._disk_mgr.attach_disk_rw()
+                self._local.set_disk_state(DiskState.ATTACHED_RW)
+                self._emit(HaEventType.DISK_ATTACHED,
+                           f"RPD attached to {self._cfg.cluster.node_name} in RW mode")
+                return
+            except RuntimeError as exc:
+                if attempt < max_attempts and "already being used" in str(exc):
+                    log.warning(
+                        "ATTACH attempt %d/%d failed (RESOURCE_IN_USE) — "
+                        "retrying in %ds: %s",
+                        attempt, max_attempts, backoff, exc,
+                    )
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 30)
+                else:
+                    raise
 
     def _step_mount_disk(self) -> None:
         self._disk_mgr.mount_disk()
